@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import hmac
 import json
@@ -22,15 +24,19 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox
-except Exception:
+    TK_IMPORT_ERROR = None
+except Exception as exc:
     tk = None
     filedialog = None
     messagebox = None
+    TK_IMPORT_ERROR = exc
 
 try:
     import customtkinter as ctk
-except Exception:
+    CTK_IMPORT_ERROR = None
+except Exception as exc:
     ctk = None
+    CTK_IMPORT_ERROR = exc
 
 try:
     import litert_lm
@@ -57,7 +63,8 @@ EXPECTED_HASH = "ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e4
 MODELS_DIR = Path("models")
 MODEL_PATH = MODELS_DIR / MODEL_FILE
 ENCRYPTED_MODEL = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".aes")
-RUNTIME_MODEL_PATH = MODELS_DIR / (MODEL_FILE + ".runtime")
+LEGACY_RUNTIME_MODEL_PATH = MODELS_DIR / (MODEL_FILE + ".runtime")
+RUNTIME_MODEL_PATH = MODELS_DIR / f"runtime-{MODEL_FILE}"
 DB_PATH = Path("chat_history.db.aes")
 KEY_PATH = Path(".enc_key")
 SETTINGS_PATH = Path("gui_settings.json")
@@ -101,6 +108,10 @@ DEFAULT_SETTINGS = {
     "delete_plaintext_after_encrypt": True,
     "chat_memory_turns": 6,
 }
+
+GUI_READY = tk is not None and ctk is not None
+DialogBase = ctk.CTkToplevel if GUI_READY else object
+AppBase = ctk.CTk if GUI_READY else object
 
 
 def human_size(num_bytes: int) -> str:
@@ -582,6 +593,7 @@ def _status_report(reporter: Optional[Callable[[str, Any], None]], kind: str, pa
 
 @contextmanager
 def unlocked_model_path(key: bytes):
+    safe_cleanup([LEGACY_RUNTIME_MODEL_PATH])
     if ENCRYPTED_MODEL.exists():
         decrypt_file(ENCRYPTED_MODEL, RUNTIME_MODEL_PATH, key)
         try:
@@ -758,8 +770,10 @@ def storage_summary(key: Optional[bytes]) -> Dict[str, str]:
     }
 
 
-class StartupPasswordDialog(ctk.CTkToplevel):
+class StartupPasswordDialog(DialogBase):
     def __init__(self, app: "HumoidStudioApp"):
+        if not GUI_READY:
+            raise RuntimeError("The GUI dependencies are not available.")
         super().__init__(app)
         self.app = app
         self.mode = detect_key_mode()
@@ -972,8 +986,10 @@ class StartupPasswordDialog(ctk.CTkToplevel):
         )
 
 
-class HumoidStudioApp(ctk.CTk):
+class HumoidStudioApp(AppBase):
     def __init__(self):
+        if not GUI_READY:
+            raise RuntimeError("The GUI dependencies are not available.")
         super().__init__()
         self.settings_data = load_settings()
         self.key: Optional[bytes] = None
@@ -2203,16 +2219,22 @@ class HumoidStudioApp(ctk.CTk):
 
 
 def main() -> None:
-    if tk is None or ctk is None:
+    if not GUI_READY:
         missing = []
         if tk is None:
             missing.append("tkinter")
         if ctk is None:
             missing.append("customtkinter")
+        details = []
+        if TK_IMPORT_ERROR is not None:
+            details.append(f"tkinter import error: {TK_IMPORT_ERROR}")
+        if CTK_IMPORT_ERROR is not None:
+            details.append(f"customtkinter import error: {CTK_IMPORT_ERROR}")
         raise SystemExit(
             "This app now launches as a GUI and requires "
             + ", ".join(missing)
             + ". Install the project dependencies and make sure Python Tk support is available."
+            + (f"\n\nDetails:\n- " + "\n- ".join(details) if details else "")
         )
 
     app = HumoidStudioApp()

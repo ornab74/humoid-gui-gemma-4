@@ -1,0 +1,36 @@
+# Python cache and build output
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Coverage and profiling
+.coverage
+.pytest_cache/
+htmlcov/
+*.profraw
+
+# Editor and local tool state
+.vscode/
+.idea/
+.codex
+
+# Local app secrets and runtime data
+.enc_key
+chat_history.db.aes
+gui_settings.json
+.litert_lm_cache/
+
+# Downloaded or generated model artifacts
+models/*.litertlm
+models/*.litertlm.aes
+models/*.runtime
+
+# Optional exports and logs
+road_scan_*.json
+*.log

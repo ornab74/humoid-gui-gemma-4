@@ -16,7 +16,8 @@ sudo apt install -y \
     nano \
     python3 \
     python3-pip \
-    python3-venv
+    python3-venv \
+    python3-tk
 
 echo "Cloning or updating Humoid-Gui-Gemma repo..."
 mkdir -p "$APP_DIR"
@@ -37,6 +38,8 @@ python -m pip install --upgrade pip
 
 if [ -f "$APP_DIR/requirements.txt" ]; then
     pip install -r "$APP_DIR/requirements.txt"
+elif [ -f "$APP_DIR/requirements.in" ]; then
+    pip install -r "$APP_DIR/requirements.in"
 fi
 
 chmod +x "$APP_DIR/main.py" 2>/dev/null || true

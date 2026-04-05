@@ -1,23 +1,36 @@
-import os
-import sys
-import time
-import json
 import hashlib
-import asyncio
-import getpass
+import hmac
+import json
 import math
+import os
 import random
-import re
+import sqlite3
+import sys
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Tuple, Dict
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
-import aiosqlite
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except Exception:
+    tk = None
+    filedialog = None
+    messagebox = None
+
+try:
+    import customtkinter as ctk
+except Exception:
+    ctk = None
 
 try:
     import litert_lm
@@ -44,118 +57,91 @@ EXPECTED_HASH = "ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e4
 MODELS_DIR = Path("models")
 MODEL_PATH = MODELS_DIR / MODEL_FILE
 ENCRYPTED_MODEL = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".aes")
+RUNTIME_MODEL_PATH = MODELS_DIR / (MODEL_FILE + ".runtime")
 DB_PATH = Path("chat_history.db.aes")
 KEY_PATH = Path(".enc_key")
+SETTINGS_PATH = Path("gui_settings.json")
 CACHE_DIR = Path(".litert_lm_cache")
+STREAM_MAGIC = b"HGGM2"
+
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-CSI = "\x1b["
+PALETTE = {
+    "window": "#f8f2ea",
+    "canvas": "#fffaf6",
+    "panel": "#fff7ef",
+    "panel_alt": "#fff0df",
+    "card": "#fffdf9",
+    "card_soft": "#fceee2",
+    "text": "#1d2733",
+    "muted": "#5d6977",
+    "line": "#e6cbb3",
+    "accent_orange": "#ff7a59",
+    "accent_gold": "#ffb703",
+    "accent_teal": "#00b894",
+    "accent_blue": "#00a6fb",
+    "accent_pink": "#f15bb5",
+    "accent_indigo": "#4d7cff",
+    "danger": "#d9485f",
+    "ok": "#199c73",
+}
+
+TIE_DYE = [
+    ("#ff7a59", "#f56545"),
+    ("#ffb703", "#f29a05"),
+    ("#00b894", "#00a37d"),
+    ("#00a6fb", "#0287da"),
+    ("#f15bb5", "#d94aa2"),
+    ("#4d7cff", "#3e67d7"),
+]
+
+DEFAULT_SETTINGS = {
+    "include_system_entropy": True,
+    "delete_plaintext_after_encrypt": True,
+    "chat_memory_turns": 6,
+}
 
 
-def clear_screen() -> None:
-    sys.stdout.write(CSI + "2J" + CSI + "H")
-    sys.stdout.flush()
+def human_size(num_bytes: int) -> str:
+    size = float(max(0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+        size /= 1024.0
+    return f"{int(num_bytes)}B"
 
 
-def show_cursor() -> None:
-    sys.stdout.write(CSI + "?25h")
-    sys.stdout.flush()
-
-
-def color(text: str, fg: Optional[int] = None, bold: bool = False) -> str:
-    codes = []
-    if fg is not None:
-        codes.append(str(fg))
-    if bold:
-        codes.append("1")
-    if not codes:
-        return text
-    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
-
-
-def boxed(title: str, lines: List[str], width: int = 72) -> str:
-    top = "┌" + "─" * (width - 2) + "┐"
-    bot = "└" + "─" * (width - 2) + "┘"
-    title_line = f"│ {color(title, fg=36, bold=True):{width - 4}} │"
-    body: List[str] = []
-    for line in lines:
-        chunks = [line[i : i + width - 4] for i in range(0, len(line), width - 4)] or [""]
-        for chunk in chunks:
-            body.append(f"│ {chunk:{width - 4}} │")
-    return "\n".join([top, title_line] + body + [bot])
-
-
-def getch() -> bytes:
-    try:
-        import tty
-        import termios
-
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+def safe_cleanup(paths: List[Path]) -> None:
+    for path in paths:
         try:
-            tty.setraw(fd)
-            return os.read(fd, 3)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except Exception:
-        s = input()
-        return s[:1].encode() if s else b""
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
 
 
-def read_menu_choice(num_items: int, prompt: str = "Use ↑↓ arrows or number, Enter to select: ") -> int:
-    print(prompt)
-    try:
-        idx = 0
-        while True:
-            ch = getch()
-            if not ch:
-                continue
-            if ch in (b"\x1b[A", b"\x1b\x00A"):
-                idx = (idx - 1) % num_items
-            elif ch in (b"\x1b[B", b"\x1b\x00B"):
-                idx = (idx + 1) % num_items
-            elif ch in (b"\r", b"\n", b"\x0d"):
-                return idx
-            else:
-                try:
-                    s = ch.decode(errors="ignore").strip()
-                    if s.isdigit():
-                        n = int(s)
-                        if 1 <= n <= num_items:
-                            return n - 1
-                except Exception:
-                    pass
-            sys.stdout.write(f"\rSelected: {idx + 1}/{num_items} ")
-            sys.stdout.flush()
-    except Exception:
-        while True:
-            s = input("Enter number: ").strip()
-            if s.isdigit():
-                n = int(s)
-                if 1 <= n <= num_items:
-                    return n - 1
+def _temp_path(directory: Path, suffix: str, prefix: str = "humoid_") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, dir=directory, delete=False)
+    handle.close()
+    return Path(handle.name)
 
 
-
-def aes_encrypt(data: bytes, key: bytes) -> bytes:
-    aes = AESGCM(key)
-    nonce = os.urandom(12)
-    return nonce + aes.encrypt(nonce, data, None)
+def _temp_db_path() -> Path:
+    return _temp_path(DB_PATH.parent, ".db", prefix="history_")
 
 
-def aes_decrypt(data: bytes, key: bytes) -> bytes:
-    aes = AESGCM(key)
-    nonce, ct = data[:12], data[12:]
-    return aes.decrypt(nonce, ct, None)
+def _temp_model_path() -> Path:
+    return _temp_path(MODELS_DIR, ".litertlm", prefix="model_")
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _temp_encrypted_model_path() -> Path:
+    return _temp_path(MODELS_DIR, ".litertlm.aes", prefix="vault_")
+
+
+def _temp_encrypted_db_path() -> Path:
+    return _temp_path(DB_PATH.parent, ".db.aes", prefix="vault_history_")
 
 
 def _write_key_file(key_bytes: bytes) -> None:
@@ -166,7 +152,7 @@ def _write_key_file(key_bytes: bytes) -> None:
         pass
 
 
-def derive_key_from_passphrase(pw: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
+def derive_key_from_passphrase(password: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
     if salt is None:
         salt = os.urandom(16)
     kdf_der = PBKDF2HMAC(
@@ -175,199 +161,223 @@ def derive_key_from_passphrase(pw: str, salt: Optional[bytes] = None) -> Tuple[b
         salt=salt,
         iterations=200_000,
     )
-    return salt, kdf_der.derive(pw.encode("utf-8"))
+    return salt, kdf_der.derive(password.encode("utf-8"))
 
 
-def get_or_create_key() -> bytes:
-    if KEY_PATH.exists():
-        d = KEY_PATH.read_bytes()
-        if len(d) >= 48:
-            return d[16:48]
-        return d[:32]
-    key = AESGCM.generate_key(256)
-    _write_key_file(key)
-    print(f"🔑 New random key generated and saved to {KEY_PATH}")
+def detect_key_mode() -> str:
+    if not KEY_PATH.exists():
+        return "missing"
+    data = KEY_PATH.read_bytes()
+    if len(data) >= 48:
+        return "passphrase"
+    if len(data) >= 32:
+        return "legacy_raw"
+    return "invalid"
+
+
+def read_legacy_key() -> bytes:
+    data = KEY_PATH.read_bytes()
+    if len(data) < 32:
+        raise ValueError("The existing key file is invalid.")
+    return data[:32]
+
+
+def unlock_key_with_passphrase(password: str) -> bytes:
+    data = KEY_PATH.read_bytes()
+    if len(data) < 48:
+        raise ValueError("No passphrase-derived key is stored yet.")
+    salt = data[:16]
+    stored_key = data[16:48]
+    _, derived_key = derive_key_from_passphrase(password, salt)
+    if not hmac.compare_digest(stored_key, derived_key):
+        raise ValueError("Incorrect password.")
+    return derived_key
+
+
+def create_passphrase_key(password: str) -> bytes:
+    salt, key = derive_key_from_passphrase(password)
+    _write_key_file(salt + key)
     return key
 
 
-def ensure_key_interactive() -> bytes:
-    if KEY_PATH.exists():
-        data = KEY_PATH.read_bytes()
-        if len(data) >= 48:
-            return data[16:48]
-        if len(data) >= 32:
-            return data[:32]
+def aes_encrypt_bytes(data: bytes, key: bytes) -> bytes:
+    aes = AESGCM(key)
+    nonce = os.urandom(12)
+    return nonce + aes.encrypt(nonce, data, None)
 
-    print("Key not found. Create new key:")
-    print("  1) Generate random key (saved raw)")
-    print("  2) Derive from passphrase (salt+derived saved)")
-    opt = input("Choose (1/2): ").strip()
 
-    if opt == "2":
-        pw = getpass.getpass("Enter passphrase: ")
-        pw2 = getpass.getpass("Confirm: ")
-        if pw != pw2:
-            print("Passphrases mismatch. Aborting.")
-            sys.exit(1)
-        salt, key = derive_key_from_passphrase(pw)
-        _write_key_file(salt + key)
-        print(f"Saved salt+derived key to {KEY_PATH}")
-        return key
+def aes_decrypt_bytes(data: bytes, key: bytes) -> bytes:
+    aes = AESGCM(key)
+    nonce, ciphertext = data[:12], data[12:]
+    return aes.decrypt(nonce, ciphertext, None)
 
-    key = AESGCM.generate_key(256)
-    _write_key_file(key)
-    print(f"Saved random key to {KEY_PATH}")
-    return key
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def encrypt_file(src: Path, dest: Path, key: bytes) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    nonce = os.urandom(12)
+    encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+
+    with src.open("rb") as in_handle, dest.open("wb") as out_handle:
+        out_handle.write(STREAM_MAGIC)
+        out_handle.write(nonce)
+        for chunk in iter(lambda: in_handle.read(1024 * 1024), b""):
+            out_handle.write(encryptor.update(chunk))
+        out_handle.write(encryptor.finalize())
+        out_handle.write(encryptor.tag)
+
+
+def _decrypt_stream_file(src: Path, dest: Path, key: bytes) -> None:
+    header_size = len(STREAM_MAGIC) + 12
+    tag_size = 16
+    total_size = src.stat().st_size
+    if total_size < header_size + tag_size:
+        raise ValueError(f"{src} is not a valid encrypted model file.")
+
+    with src.open("rb") as in_handle:
+        magic = in_handle.read(len(STREAM_MAGIC))
+        if magic != STREAM_MAGIC:
+            raise ValueError(f"{src} has an unknown encrypted file format.")
+        nonce = in_handle.read(12)
+        in_handle.seek(total_size - tag_size)
+        tag = in_handle.read(tag_size)
+        in_handle.seek(header_size)
+        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+        remaining = total_size - header_size - tag_size
+
+        with dest.open("wb") as out_handle:
+            while remaining > 0:
+                chunk = in_handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                out_handle.write(decryptor.update(chunk))
+            out_handle.write(decryptor.finalize())
+
+
+def decrypt_file(src: Path, dest: Path, key: bytes) -> None:
+    with src.open("rb") as handle:
+        header = handle.read(len(STREAM_MAGIC))
+    if header == STREAM_MAGIC:
+        _decrypt_stream_file(src, dest, key)
+        return
+
+    plaintext = aes_decrypt_bytes(src.read_bytes(), key)
+    dest.write_bytes(plaintext)
 
 
 def download_model_httpx(
     url: str,
     dest: Path,
-    show_progress: bool = True,
-    timeout: Optional[float] = None,
+    *,
     expected_sha: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> str:
-    print(f"⬇️  Downloading model from {url}\nTo: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
 
-    with httpx.stream("GET", url, follow_redirects=True, timeout=timeout) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length") or 0)
+    with httpx.stream("GET", url, follow_redirects=True, timeout=None) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("Content-Length") or 0)
         done = 0
-        h = hashlib.sha256()
-
-        with dest.open("wb") as f:
-            for chunk in r.iter_bytes(chunk_size=8192):
+        with dest.open("wb") as handle:
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                 if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
+                    continue
+                handle.write(chunk)
+                digest.update(chunk)
                 done += len(chunk)
-                if total and show_progress:
-                    pct = done / total * 100
-                    bar = int(pct // 2)
-                    sys.stdout.write(
-                        f"\r[{('#' * bar).ljust(50)}] {pct:5.1f}% ({done // 1024}KB/{total // 1024}KB)"
-                    )
-                    sys.stdout.flush()
+                if progress_callback:
+                    progress_callback(done, total)
 
-    if show_progress:
-        print("\n✅ Download complete.")
-
-    sha = h.hexdigest()
-    print(f"SHA256: {sha}")
-
-    if expected_sha:
-        if sha.lower() == expected_sha.lower():
-            print(color("SHA256 matches expected.", fg=32, bold=True))
-        else:
-            print(color(f"SHA256 MISMATCH! expected {expected_sha} got {sha}", fg=31, bold=True))
-            keep_file = input("Hash mismatch. Keep this download anyway? (y/N): ").strip().lower() == "y"
-            if not keep_file:
-                try:
-                    dest.unlink()
-                except Exception:
-                    pass
-                raise ValueError("Download aborted because SHA256 verification failed.")
+    sha = digest.hexdigest()
+    if expected_sha and sha.lower() != expected_sha.lower():
+        safe_cleanup([dest])
+        raise ValueError(f"SHA256 mismatch. Expected {expected_sha}, got {sha}.")
     return sha
 
 
-def encrypt_file(src: Path, dest: Path, key: bytes) -> None:
-    print(f"🔐 Encrypting {src} -> {dest}")
-    data = src.read_bytes()
-    start = time.time()
-    enc = aes_encrypt(data, key)
-    dest.write_bytes(enc)
-    print(f"✅ Encrypted ({len(enc)} bytes) in {time.time() - start:.2f}s")
+def _initialize_plaintext_db(path: Path) -> None:
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)"
+        )
+        db.commit()
 
 
-def decrypt_file(src: Path, dest: Path, key: bytes) -> None:
-    print(f"🔓 Decrypting {src} -> {dest}")
-    enc = src.read_bytes()
-    dest.write_bytes(aes_decrypt(enc, key))
-    print(f"✅ Decrypted ({dest.stat().st_size} bytes)")
+@contextmanager
+def unlocked_db_path(key: bytes):
+    temp_db = _temp_db_path()
+    try:
+        if DB_PATH.exists():
+            decrypt_file(DB_PATH, temp_db, key)
+        else:
+            _initialize_plaintext_db(temp_db)
+        yield temp_db
+        encrypt_file(temp_db, DB_PATH, key)
+    finally:
+        safe_cleanup([temp_db])
 
 
-def _temp_db_path() -> Path:
-    tmp = tempfile.NamedTemporaryFile(prefix="litert_", suffix=".db", delete=False)
-    tmp.close()
-    return Path(tmp.name)
-
-
-def safe_cleanup(paths: List[Path]) -> None:
-    for p in paths:
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
-
-
-async def init_db(key: bytes) -> None:
+def init_db(key: bytes) -> None:
     if DB_PATH.exists():
         return
-    tmp_db = _temp_db_path()
-    try:
-        async with aiosqlite.connect(tmp_db) as db:
-            await db.execute(
-                "CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)"
-            )
-            await db.commit()
-        DB_PATH.write_bytes(aes_encrypt(tmp_db.read_bytes(), key))
-    finally:
-        safe_cleanup([tmp_db])
+    with unlocked_db_path(key):
+        return
 
 
-async def log_interaction(prompt: str, response: str, key: bytes) -> None:
-    dec = _temp_db_path()
-    try:
-        decrypt_file(DB_PATH, dec, key)
-        async with aiosqlite.connect(dec) as db:
-            await db.execute(
+def log_interaction(prompt: str, response: str, key: bytes) -> None:
+    with unlocked_db_path(key) as temp_db:
+        with sqlite3.connect(temp_db) as db:
+            db.execute(
                 "INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)",
                 (time.strftime("%Y-%m-%d %H:%M:%S"), prompt, response),
             )
-            await db.commit()
-        DB_PATH.write_bytes(aes_encrypt(dec.read_bytes(), key))
-    finally:
-        safe_cleanup([dec])
+            db.commit()
 
 
-async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Optional[str] = None):
-    rows = []
-    dec = _temp_db_path()
-    try:
-        decrypt_file(DB_PATH, dec, key)
-        async with aiosqlite.connect(dec) as db:
+def fetch_history(key: bytes, limit: int = 12, offset: int = 0, search: Optional[str] = None) -> List[Tuple[int, str, str, str]]:
+    rows: List[Tuple[int, str, str, str]] = []
+    with unlocked_db_path(key) as temp_db:
+        with sqlite3.connect(temp_db) as db:
             if search:
-                q = f"%{search}%"
-                async with db.execute(
-                    "SELECT id,timestamp,prompt,response FROM history WHERE prompt LIKE ? OR response LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (q, q, limit, offset),
-                ) as cur:
-                    async for r in cur:
-                        rows.append(r)
+                query = f"%{search}%"
+                cursor = db.execute(
+                    "SELECT id, timestamp, prompt, response FROM history "
+                    "WHERE prompt LIKE ? OR response LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (query, query, limit, offset),
+                )
             else:
-                async with db.execute(
-                    "SELECT id,timestamp,prompt,response FROM history ORDER BY id DESC LIMIT ? OFFSET ?",
+                cursor = db.execute(
+                    "SELECT id, timestamp, prompt, response FROM history ORDER BY id DESC LIMIT ? OFFSET ?",
                     (limit, offset),
-                ) as cur:
-                    async for r in cur:
-                        rows.append(r)
-        DB_PATH.write_bytes(aes_encrypt(dec.read_bytes(), key))
-    finally:
-        safe_cleanup([dec])
+                )
+            rows.extend(cursor.fetchall())
     return rows
+
+
+def count_history_rows(key: bytes) -> int:
+    with unlocked_db_path(key) as temp_db:
+        with sqlite3.connect(temp_db) as db:
+            row = db.execute("SELECT COUNT(*) FROM history").fetchone()
+            return int(row[0] if row else 0)
 
 
 def require_litert_lm() -> None:
     if litert_lm is None:
         raise RuntimeError(
-            "LiteRT-LM Python package is not installed. Install it with `pip install litert-lm-api-nightly`."
+            "LiteRT-LM is not installed. Install the project dependencies first so the local model runtime is available."
         )
 
 
-def load_litert_engine_blocking(model_path: Path):
+def load_litert_engine(model_path: Path):
     require_litert_lm()
     try:
         litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
@@ -381,88 +391,58 @@ def load_litert_engine_blocking(model_path: Path):
 
 
 def create_default_messages(system_text: Optional[str] = None) -> List[dict]:
-    messages: List[dict] = []
-    if system_text:
-        messages.append(
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_text}],
-            }
-        )
-    return messages
+    if not system_text:
+        return []
+    return [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": system_text}],
+        }
+    ]
 
 
 def response_to_text(response: dict) -> str:
     if not isinstance(response, dict):
         return str(response).strip()
     parts = response.get("content", [])
-    texts = []
+    texts: List[str] = []
     for item in parts:
         if isinstance(item, dict) and item.get("type") == "text":
             texts.append(item.get("text", ""))
     return "".join(texts).strip()
 
 
-def litert_chat_blocking(
-    model_path: Path,
-    user_text: str,
-    *,
-    system_text: Optional[str] = None,
-    stream: bool = False,
-) -> str:
-    engine = load_litert_engine_blocking(model_path)
+def litert_chat_blocking(model_path: Path, user_text: str, *, system_text: Optional[str] = None) -> str:
+    engine = load_litert_engine(model_path)
     with engine:
         messages = create_default_messages(system_text)
         with engine.create_conversation(messages=messages) as conversation:
-            if stream:
-                chunks: List[str] = []
-                for chunk in conversation.send_message_async(user_text):
-                    text = response_to_text(chunk)
-                    if text:
-                        print(text, end="", flush=True)
-                        chunks.append(text)
-                print()
-                return "".join(chunks).strip()
             return response_to_text(conversation.send_message(user_text))
-
-
-def litert_classify_blocking(
-    model_path: Path,
-    user_text: str,
-    *,
-    system_text: Optional[str] = None,
-) -> str:
-    return litert_chat_blocking(model_path, user_text, system_text=system_text, stream=False)
-
 
 
 def collect_system_metrics() -> Dict[str, float]:
     if psutil is None:
-        raise RuntimeError("psutil is required for system metrics")
+        raise RuntimeError("psutil is required for system metrics.")
 
     cpu = psutil.cpu_percent(interval=0.1) / 100.0
     mem = psutil.virtual_memory().percent / 100.0
     try:
         load_raw = os.getloadavg()[0]
-        cpu_cnt = psutil.cpu_count(logical=True) or 1
-        load1 = max(0.0, min(1.0, load_raw / max(1.0, float(cpu_cnt))))
+        cpu_count = psutil.cpu_count(logical=True) or 1
+        load1 = max(0.0, min(1.0, load_raw / max(1.0, float(cpu_count))))
     except Exception:
         load1 = cpu
     try:
-        temps_map = psutil.sensors_temperatures()
-        if temps_map:
-            first = next(iter(temps_map.values()))[0].current
-            temp = max(0.0, min(1.0, (first - 20.0) / 70.0))
+        temp_groups = psutil.sensors_temperatures()
+        if temp_groups:
+            first_group = next(iter(temp_groups.values()))
+            first_value = first_group[0].current
+            temp = max(0.0, min(1.0, (first_value - 20.0) / 70.0))
         else:
             temp = 0.0
     except Exception:
         temp = 0.0
-    return {
-        "cpu": float(max(0.0, min(1.0, cpu))),
-        "mem": float(max(0.0, min(1.0, mem))),
-        "load1": float(max(0.0, min(1.0, load1))),
-        "temp": float(max(0.0, min(1.0, temp))),
-    }
+    return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp}
 
 
 def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
@@ -473,11 +453,11 @@ def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
     r = cpu * (1.0 + load1)
     g = mem * (1.0 + load1 * 0.5)
     b = temp * (0.5 + cpu * 0.5)
-    maxi = max(r, g, b, 1.0)
+    top = max(r, g, b, 1.0)
     return (
-        float(max(0.0, min(1.0, r / maxi))),
-        float(max(0.0, min(1.0, g / maxi))),
-        float(max(0.0, min(1.0, b / maxi))),
+        float(max(0.0, min(1.0, r / top))),
+        float(max(0.0, min(1.0, g / top))),
+        float(max(0.0, min(1.0, b / top))),
     )
 
 
@@ -493,10 +473,10 @@ def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) 
         noise = (random.random() - 0.5) * 0.08
         return max(0.0, min(1.0, base + noise))
 
-    dev = qml.device("default.qubit", wires=2, shots=shots)
+    device = qml.device("default.qubit", wires=2, shots=shots)
 
-    @qml.qnode(dev)
-    def circuit(a, b, c):
+    @qml.qnode(device)
+    def circuit(a: float, b: float, c: float):
         qml.RX(a * math.pi, wires=0)
         qml.RY(b * math.pi, wires=1)
         qml.CNOT(wires=[0, 1])
@@ -565,8 +545,8 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
 
 
 def normalize_risk_label(text: str) -> str:
-    candidate = (text or "").strip().split()
-    label = candidate[0].capitalize() if candidate else ""
+    pieces = (text or "").strip().split()
+    label = pieces[0].capitalize() if pieces else ""
     if label in ("Low", "Medium", "High"):
         return label
     lowered = (text or "").lower()
@@ -579,346 +559,1664 @@ def normalize_risk_label(text: str) -> str:
     return "Medium"
 
 
-
-def header(status: dict) -> None:
-    s = f" Secure LiteRT-LM CLI — Model: {'loaded' if status.get('model_loaded') else 'none'} | Key: {'present' if status.get('key') else 'missing'} "
-    print(color(s.center(80, '─'), fg=35, bold=True))
-
-
-def model_manager(state: dict) -> None:
-    while True:
-        clear_screen()
-        header(state)
-        lines = [
-            "1) Download model from Hugging Face",
-            "2) Verify plaintext model hash (compute SHA256)",
-            "3) Encrypt plaintext model -> .aes",
-            "4) Decrypt .aes -> plaintext (temporary)",
-            "5) Delete plaintext model",
-            "6) Back",
-        ]
-        print(boxed("Model Manager", lines))
-        choice = input("Choose (1-6): ").strip()
-
-        if choice == "1":
-            if MODEL_PATH.exists() and input("Plaintext model exists; overwrite? (y/N): ").strip().lower() != "y":
-                continue
-            try:
-                url = MODEL_REPO + MODEL_FILE
-                sha = download_model_httpx(url, MODEL_PATH, show_progress=True, timeout=None, expected_sha=EXPECTED_HASH)
-                print(f"Downloaded to {MODEL_PATH}")
-                print(f"Computed SHA256: {sha}")
-                if input("Encrypt downloaded model with current key now? (Y/n): ").strip().lower() != "n":
-                    encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state["key"])
-                    print(f"Encrypted -> {ENCRYPTED_MODEL}")
-                    if input("Remove plaintext model? (Y/n): ").strip().lower() != "n":
-                        MODEL_PATH.unlink()
-                        print("Plaintext removed.")
-            except Exception as e:
-                print(f"Download failed: {e}")
-            input("Enter to continue...")
-
-        elif choice == "2":
-            if not MODEL_PATH.exists():
-                print("No plaintext model found.")
-            else:
-                print(f"SHA256: {sha256_file(MODEL_PATH)}")
-                if EXPECTED_HASH:
-                    print(f"Expected: {EXPECTED_HASH}")
-            input("Enter to continue...")
-
-        elif choice == "3":
-            if not MODEL_PATH.exists():
-                print("No plaintext model to encrypt.")
-            else:
-                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state["key"])
-                if input("Remove plaintext? (Y/n): ").strip().lower() != "n":
-                    MODEL_PATH.unlink()
-                    print("Removed plaintext.")
-            input("Enter...")
-
-        elif choice == "4":
-            if not ENCRYPTED_MODEL.exists():
-                print("No .aes model present.")
-            else:
-                decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, state["key"])
-            input("Enter...")
-
-        elif choice == "5":
-            if MODEL_PATH.exists() and input(f"Delete {MODEL_PATH}? (y/N): ").strip().lower() == "y":
-                MODEL_PATH.unlink()
-                print("Deleted.")
-            elif not MODEL_PATH.exists():
-                print("No plaintext model.")
-            input("Enter...")
-
-        elif choice == "6":
-            return
-
-        else:
-            print("Invalid.")
-            input("Enter...")
+def load_settings() -> Dict[str, Any]:
+    if not SETTINGS_PATH.exists():
+        return dict(DEFAULT_SETTINGS)
+    try:
+        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update({k: raw.get(k, v) for k, v in DEFAULT_SETTINGS.items()})
+    return settings
 
 
-async def chat_session(state: dict) -> None:
-    if not ENCRYPTED_MODEL.exists():
-        print("No encrypted model found. Please download & encrypt first.")
-        input("Enter...")
-        return
+def save_settings(settings: Dict[str, Any]) -> None:
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
-    decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, state["key"])
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=1) as ex:
+
+def _status_report(reporter: Optional[Callable[[str, Any], None]], kind: str, payload: Any) -> None:
+    if reporter:
+        reporter(kind, payload)
+
+
+@contextmanager
+def unlocked_model_path(key: bytes):
+    if ENCRYPTED_MODEL.exists():
+        decrypt_file(ENCRYPTED_MODEL, RUNTIME_MODEL_PATH, key)
         try:
-            state["model_loaded"] = True
-            await init_db(state["key"])
-            print("Type /exit to return, /history to show last 10 messages.")
-            while True:
-                prompt = input("\nYou> ").strip()
-                if not prompt:
-                    continue
-                if prompt in ("/exit", "exit", "quit"):
-                    break
-                if prompt == "/history":
-                    rows = await fetch_history(state["key"], limit=10)
-                    for r in rows:
-                        print(f"[{r[0]}] {r[1]}\nQ: {r[2]}\nA: {r[3]}\n{'-' * 30}")
-                    continue
-
-                print("🤖 Thinking...")
-                try:
-                    result = await loop.run_in_executor(
-                        ex,
-                        lambda: litert_chat_blocking(
-                            MODEL_PATH,
-                            prompt,
-                            system_text="You are a helpful assistant.",
-                            stream=True,
-                        ),
-                    )
-                    if not result:
-                        result = ""
-                    print()
-                    await log_interaction(prompt, result, state["key"])
-                except Exception as e:
-                    print(f"Generation failed: {e}")
+            yield RUNTIME_MODEL_PATH
         finally:
-            print("Re-encrypting model and removing plaintext...")
-            try:
-                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state["key"])
-                MODEL_PATH.unlink()
-            except Exception as e:
-                print(f"Cleanup failed: {e}")
-            state["model_loaded"] = False
-            input("Enter...")
-
-
-async def road_scanner_flow(state: dict) -> None:
-    if not ENCRYPTED_MODEL.exists():
-        print("No encrypted model found.")
-        input("Enter...")
+            if RUNTIME_MODEL_PATH.exists():
+                encrypt_file(RUNTIME_MODEL_PATH, ENCRYPTED_MODEL, key)
+                safe_cleanup([RUNTIME_MODEL_PATH])
         return
 
-    data: Dict[str, str] = {}
-    clear_screen()
-    header(state)
-    print(boxed("Road Scanner - Step 1/6", ["Leave blank for defaults"]))
-    data["location"] = input("Location (e.g., 'I-95 NB mile 12'): ").strip() or "unspecified location"
-    data["road_type"] = input("Road type (highway/urban/residential): ").strip() or "highway"
-    data["weather"] = input("Weather/visibility: ").strip() or "clear"
-    data["traffic"] = input("Traffic density (low/med/high): ").strip() or "low"
-    data["obstacles"] = input("Reported obstacles: ").strip() or "none"
-    data["sensor_notes"] = input("Sensor notes: ").strip() or "none"
+    if MODEL_PATH.exists():
+        yield MODEL_PATH
+        return
 
-    decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, state["key"])
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        try:
-            system_text, prompt = build_road_scanner_prompt(data, include_system_entropy=True)
-            print("Scanning...")
-            raw = await loop.run_in_executor(
-                ex,
-                lambda: litert_classify_blocking(MODEL_PATH, prompt, system_text=system_text),
+    raise FileNotFoundError("No model is available yet. Download and encrypt it from the Model Lab tab first.")
+
+
+def build_chat_prompt(user_text: str, memory: List[Tuple[str, str]], turns: int = 6) -> str:
+    recent = memory[-max(0, turns * 2) :]
+    if not recent:
+        return user_text
+
+    lines = ["Conversation so far:"]
+    for role, message in recent:
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"{label}: {message}")
+    lines.append("")
+    lines.append(f"User: {user_text}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def run_chat_request(key: bytes, prompt: str, memory: List[Tuple[str, str]], memory_turns: int) -> str:
+    init_db(key)
+    compiled_prompt = build_chat_prompt(prompt, memory, turns=memory_turns)
+    with unlocked_model_path(key) as model_path:
+        reply = litert_chat_blocking(
+            model_path,
+            compiled_prompt,
+            system_text="You are a warm, concise, helpful assistant running fully on the local machine.",
+        )
+    log_interaction(prompt, reply, key)
+    return reply
+
+
+def run_road_scan(key: bytes, data: Dict[str, str], include_system_entropy: bool) -> Dict[str, str]:
+    init_db(key)
+    system_text, prompt = build_road_scanner_prompt(data, include_system_entropy=include_system_entropy)
+    with unlocked_model_path(key) as model_path:
+        raw = litert_chat_blocking(model_path, prompt, system_text=system_text)
+    label = normalize_risk_label(raw)
+    log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
+    return {
+        "label": label,
+        "raw": raw,
+        "prompt": prompt,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def download_and_encrypt_model(key: bytes, reporter: Optional[Callable[[str, Any], None]] = None) -> str:
+    plain_temp = _temp_model_path()
+    encrypted_temp = _temp_encrypted_model_path()
+    try:
+        _status_report(reporter, "status", "Downloading the Gemma model into a temporary vault...")
+
+        def progress(done: int, total: int) -> None:
+            if total:
+                _status_report(reporter, "progress", done / total)
+            _status_report(
+                reporter,
+                "status",
+                f"Downloading model... {human_size(done)} of {human_size(total) if total else 'unknown'}",
             )
-            label = normalize_risk_label(raw)
-            print("\n--- Road Scanner Result ---\n")
-            print(color(label, fg=32 if label == "Low" else 33 if label == "Medium" else 31, bold=True))
-            print("\nOptions: 1) Re-run with edits  2) Export to JSON  3) Save & return  4) Cancel")
-            ch = input("Choose (1-4): ").strip()
 
-            if ch == "1":
-                print("Re-run: editing fields. Press Enter to keep current value.")
-                for k in list(data.keys()):
-                    v = input(f"{k} [{data[k]}]: ").strip()
-                    if v:
-                        data[k] = v
-                system_text, prompt = build_road_scanner_prompt(data, include_system_entropy=True)
-                raw = await loop.run_in_executor(
-                    ex,
-                    lambda: litert_classify_blocking(MODEL_PATH, prompt, system_text=system_text),
-                )
-                label = normalize_risk_label(raw)
-                print(f"\n{label}")
-
-            if ch in ("2", "3"):
-                try:
-                    await init_db(state["key"])
-                    await log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, state["key"])
-                except Exception as e:
-                    print(f"Failed to log: {e}")
-
-            if ch == "2":
-                outp = {
-                    "input": data,
-                    "prompt": prompt,
-                    "result": label,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                fn = input("Filename to save JSON (default road_scan.json): ").strip() or "road_scan.json"
-                Path(fn).write_text(json.dumps(outp, indent=2))
-                print(f"Saved {fn}")
-        finally:
-            print("Re-encrypting model and removing plaintext...")
-            try:
-                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state["key"])
-                MODEL_PATH.unlink()
-            except Exception as e:
-                print(f"Cleanup error: {e}")
-            input("Enter to return...")
+        sha = download_model_httpx(MODEL_REPO + MODEL_FILE, plain_temp, expected_sha=EXPECTED_HASH, progress_callback=progress)
+        _status_report(reporter, "status", "Encrypting the verified model for safe local storage...")
+        encrypt_file(plain_temp, encrypted_temp, key)
+        encrypted_temp.replace(ENCRYPTED_MODEL)
+        safe_cleanup([MODEL_PATH])
+        _status_report(reporter, "status", "Model ready. The encrypted vault is sealed again.")
+        return sha
+    finally:
+        safe_cleanup([plain_temp, encrypted_temp])
 
 
-async def db_viewer_flow(state: dict) -> None:
-    if not DB_PATH.exists():
-        print("No DB found.")
-        input("Enter...")
-        return
-
-    page = 0
-    per_page = 10
-    search = None
-    while True:
-        rows = await fetch_history(state["key"], limit=per_page, offset=page * per_page, search=search)
-        clear_screen()
-        header(state)
-        print(boxed(f"History (page {page + 1})", [f"Search: {search or '(none)'}", "Commands: n=next p=prev s=search q=quit"]))
-        if not rows:
-            print("No rows on this page.")
-        else:
-            for r in rows:
-                print(f"[{r[0]}] {r[1]}\nQ: {r[2]}\nA: {r[3]}\n" + "-" * 60)
-        cmd = input("cmd (n/p/s/q): ").strip().lower()
-        if cmd == "n":
-            page += 1
-        elif cmd == "p" and page > 0:
-            page -= 1
-        elif cmd == "s":
-            search = input("Enter search keyword (empty to clear): ").strip() or None
-            page = 0
-        else:
-            break
+def encrypt_existing_plaintext_model(key: bytes, delete_plaintext: bool = True) -> None:
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError("There is no plaintext model copy to encrypt.")
+    temp_encrypted = _temp_encrypted_model_path()
+    try:
+        encrypt_file(MODEL_PATH, temp_encrypted, key)
+        temp_encrypted.replace(ENCRYPTED_MODEL)
+        if delete_plaintext:
+            safe_cleanup([MODEL_PATH])
+    finally:
+        safe_cleanup([temp_encrypted])
 
 
-def rekey_flow(state: dict) -> None:
-    print("Rekey / Rotate Key")
-    print(f"Current key file: {KEY_PATH}" if KEY_PATH.exists() else "No existing key file (creating new).")
-    choice = input("1) New random key  2) Passphrase-derived  3) Cancel\nChoose: ").strip()
-    if choice not in ("1", "2"):
-        print("Canceled.")
-        input("Enter...")
-        return
+def verify_model_hash(key: bytes) -> Tuple[str, bool]:
+    with unlocked_model_path(key) as model_path:
+        sha = sha256_file(model_path)
+    return sha, sha.lower() == EXPECTED_HASH.lower()
 
-    old_key = state["key"]
-    tmp_model = MODELS_DIR / (MODEL_FILE + ".tmp")
-    tmp_db = _temp_db_path()
+
+def reencrypt_assets(old_key: bytes, new_key: bytes, reporter: Optional[Callable[[str, Any], None]] = None) -> None:
+    temp_plain_model = _temp_model_path()
+    temp_plain_db = _temp_db_path()
+    temp_encrypted_model = _temp_encrypted_model_path()
+    temp_encrypted_db = _temp_encrypted_db_path()
+
     try:
         if ENCRYPTED_MODEL.exists():
-            decrypt_file(ENCRYPTED_MODEL, tmp_model, old_key)
+            _status_report(reporter, "status", "Unlocking the current model vault...")
+            decrypt_file(ENCRYPTED_MODEL, temp_plain_model, old_key)
+            _status_report(reporter, "status", "Sealing a fresh model vault with the new password...")
+            encrypt_file(temp_plain_model, temp_encrypted_model, new_key)
         if DB_PATH.exists():
-            decrypt_file(DB_PATH, tmp_db, old_key)
-    except Exception as e:
-        print(f"Failed to decrypt existing data with current key: {e}")
-        safe_cleanup([tmp_model, tmp_db])
-        input("Enter...")
-        return
+            _status_report(reporter, "status", "Unlocking encrypted history...")
+            decrypt_file(DB_PATH, temp_plain_db, old_key)
+            _status_report(reporter, "status", "Re-encrypting chat history with the new password...")
+            encrypt_file(temp_plain_db, temp_encrypted_db, new_key)
 
-    if choice == "1":
-        new_key = AESGCM.generate_key(256)
-        _write_key_file(new_key)
-        print("New random key generated and saved.")
-    else:
-        pw = getpass.getpass("Enter new passphrase: ")
-        pw2 = getpass.getpass("Confirm: ")
-        if pw != pw2:
-            print("Mismatch.")
-            safe_cleanup([tmp_model, tmp_db])
-            input("Enter...")
-            return
-        salt, derived = derive_key_from_passphrase(pw)
-        _write_key_file(salt + derived)
-        new_key = derived
-        print("New passphrase-derived key saved (salt+derived).")
-
-    try:
-        if tmp_model.exists():
-            encrypt_file(tmp_model, ENCRYPTED_MODEL, new_key)
-        if tmp_db.exists():
-            DB_PATH.write_bytes(aes_encrypt(tmp_db.read_bytes(), new_key))
-    except Exception as e:
-        print(f"Error during re-encryption: {e}")
+        if temp_encrypted_model.exists():
+            temp_encrypted_model.replace(ENCRYPTED_MODEL)
+        if temp_encrypted_db.exists():
+            temp_encrypted_db.replace(DB_PATH)
     finally:
-        safe_cleanup([tmp_model, tmp_db])
-        raw = KEY_PATH.read_bytes()
-        state["key"] = raw[16:48] if len(raw) >= 48 else raw[:32]
-        print("Rekey attempt finished. Verify files manually.")
-        input("Enter...")
+        safe_cleanup([temp_plain_model, temp_plain_db, temp_encrypted_model, temp_encrypted_db])
 
 
-def main_menu_loop(state: dict) -> None:
-    options = [
-        "Model Manager",
-        "Chat with model",
-        "Road Scanner",
-        "View chat history",
-        "Rekey / Rotate key",
-        "Exit",
-    ]
-    while True:
-        clear_screen()
-        header(state)
-        print()
-        print(boxed("Main Menu", [f"{i + 1}) {opt}" for i, opt in enumerate(options)]))
-        choice = options[read_menu_choice(len(options))]
-        if choice == "Model Manager":
-            model_manager(state)
-        elif choice == "Chat with model":
-            asyncio.run(chat_session(state))
-        elif choice == "Road Scanner":
-            asyncio.run(road_scanner_flow(state))
-        elif choice == "View chat history":
-            asyncio.run(db_viewer_flow(state))
-        elif choice == "Rekey / Rotate key":
-            rekey_flow(state)
-        elif choice == "Exit":
-            print("Goodbye.")
+def migrate_legacy_key_to_passphrase(password: str, reporter: Optional[Callable[[str, Any], None]] = None) -> bytes:
+    old_key = read_legacy_key()
+    salt, new_key = derive_key_from_passphrase(password)
+    reencrypt_assets(old_key, new_key, reporter=reporter)
+    _write_key_file(salt + new_key)
+    return new_key
+
+
+def rotate_to_new_passphrase(current_key: bytes, password: str, reporter: Optional[Callable[[str, Any], None]] = None) -> bytes:
+    salt, new_key = derive_key_from_passphrase(password)
+    reencrypt_assets(current_key, new_key, reporter=reporter)
+    _write_key_file(salt + new_key)
+    return new_key
+
+
+def storage_summary(key: Optional[bytes]) -> Dict[str, str]:
+    if ENCRYPTED_MODEL.exists() and MODEL_PATH.exists():
+        model_state = "Encrypted vault plus plaintext copy"
+    elif ENCRYPTED_MODEL.exists():
+        model_state = "Encrypted vault ready"
+    elif MODEL_PATH.exists():
+        model_state = "Plaintext model present"
+    else:
+        model_state = "No model downloaded yet"
+
+    encrypted_size = human_size(ENCRYPTED_MODEL.stat().st_size) if ENCRYPTED_MODEL.exists() else "0B"
+    plaintext_size = human_size(MODEL_PATH.stat().st_size) if MODEL_PATH.exists() else "0B"
+
+    if key is None:
+        history_count = "Locked"
+    else:
+        try:
+            history_count = str(count_history_rows(key))
+        except Exception:
+            history_count = "Unavailable"
+
+    return {
+        "model_state": model_state,
+        "encrypted_size": encrypted_size,
+        "plaintext_size": plaintext_size,
+        "history_count": history_count,
+        "key_mode": detect_key_mode(),
+    }
+
+
+class StartupPasswordDialog(ctk.CTkToplevel):
+    def __init__(self, app: "HumoidStudioApp"):
+        super().__init__(app)
+        self.app = app
+        self.mode = detect_key_mode()
+        self.password_var = tk.StringVar()
+        self.confirm_var = tk.StringVar()
+        self.error_var = tk.StringVar(value="")
+
+        self.title("Unlock Humoid Studio")
+        self.geometry("520x420")
+        self.minsize(520, 420)
+        self.configure(fg_color=PALETTE["panel"])
+        self.transient(app)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
+
+        frame = ctk.CTkFrame(
+            self,
+            fg_color=PALETTE["card"],
+            corner_radius=26,
+            border_width=1,
+            border_color=PALETTE["line"],
+        )
+        frame.pack(fill="both", expand=True, padx=24, pady=24)
+
+        ctk.CTkLabel(
+            frame,
+            text="Humoid Gemma Studio",
+            font=app.title_font,
+            text_color=PALETTE["text"],
+        ).pack(anchor="w", padx=28, pady=(24, 6))
+
+        subtitle = self._subtitle_text()
+        ctk.CTkLabel(
+            frame,
+            text=subtitle,
+            font=app.body_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=430,
+        ).pack(anchor="w", padx=28, pady=(0, 18))
+
+        self.banner = ctk.CTkLabel(
+            frame,
+            text=self._banner_text(),
+            font=app.small_font,
+            text_color=PALETTE["text"],
+            fg_color=PALETTE["card_soft"],
+            corner_radius=14,
+            padx=12,
+            pady=10,
+            justify="left",
+            wraplength=430,
+        )
+        self.banner.pack(fill="x", padx=28, pady=(0, 18))
+
+        self.password_entry = ctk.CTkEntry(
+            frame,
+            textvariable=self.password_var,
+            show="*",
+            placeholder_text="Password",
+            height=46,
+            corner_radius=16,
+            border_color=PALETTE["line"],
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            font=app.body_font,
+        )
+        self.password_entry.pack(fill="x", padx=28)
+
+        self.confirm_entry = ctk.CTkEntry(
+            frame,
+            textvariable=self.confirm_var,
+            show="*",
+            placeholder_text="Confirm password",
+            height=46,
+            corner_radius=16,
+            border_color=PALETTE["line"],
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            font=app.body_font,
+        )
+        if self.mode in ("missing", "legacy_raw"):
+            self.confirm_entry.pack(fill="x", padx=28, pady=(14, 0))
+
+        ctk.CTkLabel(
+            frame,
+            textvariable=self.error_var,
+            font=app.small_font,
+            text_color=PALETTE["danger"],
+            justify="left",
+            wraplength=430,
+        ).pack(anchor="w", padx=28, pady=(14, 0))
+
+        footer = ctk.CTkFrame(frame, fg_color="transparent")
+        footer.pack(fill="x", side="bottom", padx=28, pady=28)
+
+        if self.mode == "legacy_raw":
+            legacy_button = app.make_button(
+                footer,
+                "Use Legacy Key",
+                self._use_legacy_key,
+                5,
+                width=150,
+                height=44,
+            )
+            legacy_button.pack(side="left")
+
+        primary_text = {
+            "missing": "Create Vault Password",
+            "passphrase": "Unlock Studio",
+            "legacy_raw": "Migrate and Unlock",
+            "invalid": "Inspect Key File",
+        }.get(self.mode, "Unlock Studio")
+
+        self.primary_button = app.make_button(
+            footer,
+            primary_text,
+            self._submit,
+            0,
+            width=200,
+            height=46,
+        )
+        self.primary_button.pack(side="right")
+
+        self.password_entry.focus_set()
+
+    def _subtitle_text(self) -> str:
+        if self.mode == "missing":
+            return "Set a password for the encrypted model vault before the app starts."
+        if self.mode == "legacy_raw":
+            return "A legacy raw key was found. Set a password now to migrate safely to a passphrase-first vault."
+        if self.mode == "invalid":
+            return "The key file does not look valid. You can fix or remove it, then launch again."
+        return "Enter the vault password to unlock the encrypted model, history, and settings."
+
+    def _banner_text(self) -> str:
+        if self.mode == "missing":
+            return "New setup: the GUI now opens with a password gate before any model or history data is touched."
+        if self.mode == "legacy_raw":
+            return "Recommended: migrate to a password-protected vault now. Existing encrypted data will be re-wrapped safely."
+        if self.mode == "invalid":
+            return "The current key file is too short to decrypt anything. Remove it only if you know the vault data is disposable."
+        return "Passphrase mode detected. The window unlocks only after the stored key is derived from your password."
+
+    def _set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.password_entry.configure(state=state)
+        if self.mode in ("missing", "legacy_raw"):
+            self.confirm_entry.configure(state=state)
+        self.primary_button.configure(state=state)
+
+    def _close_app(self) -> None:
+        self.app.destroy()
+
+    def _use_legacy_key(self) -> None:
+        try:
+            key = read_legacy_key()
+        except Exception as exc:
+            self.error_var.set(str(exc))
             return
+        self.app.complete_unlock(key, "legacy_raw")
+        self.destroy()
+
+    def _submit(self) -> None:
+        password = self.password_var.get().strip()
+        confirm = self.confirm_var.get().strip()
+        self.error_var.set("")
+
+        if self.mode == "invalid":
+            self.error_var.set("Remove or replace the invalid key file before launching the studio.")
+            return
+        if self.mode in ("missing", "legacy_raw") and len(password) < 8:
+            self.error_var.set("Use at least 8 characters so the vault password has some strength.")
+            return
+        if self.mode in ("missing", "legacy_raw") and password != confirm:
+            self.error_var.set("The confirmation password does not match.")
+            return
+
+        if self.mode == "passphrase":
+            try:
+                key = unlock_key_with_passphrase(password)
+            except Exception as exc:
+                self.error_var.set(str(exc))
+                return
+            self.app.complete_unlock(key, "passphrase")
+            self.destroy()
+            return
+
+        if self.mode == "missing":
+            key = create_passphrase_key(password)
+            self.app.complete_unlock(key, "passphrase")
+            self.destroy()
+            return
+
+        self._set_busy(True)
+
+        def on_success(key: bytes) -> None:
+            self.app.complete_unlock(key, "passphrase")
+            self.destroy()
+
+        def on_error(exc: Exception) -> None:
+            self._set_busy(False)
+            self.error_var.set(str(exc))
+
+        self.app.run_task(
+            "Migrating the legacy key to a password-protected vault...",
+            lambda reporter: migrate_legacy_key_to_passphrase(password, reporter=reporter),
+            on_success=on_success,
+            on_error=on_error,
+        )
+
+
+class HumoidStudioApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.settings_data = load_settings()
+        self.key: Optional[bytes] = None
+        self.key_mode = "locked"
+        self.busy = False
+        self.task_queue: "queue.Queue[Tuple[str, Any]]"
+        import queue
+
+        self.task_queue = queue.Queue()
+        self.chat_memory: List[Tuple[str, str]] = []
+        self.last_scan_result: Optional[Dict[str, str]] = None
+        self.history_offset = 0
+
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
+
+        self.title_font = ctk.CTkFont(family="DejaVu Serif", size=34, weight="bold")
+        self.section_font = ctk.CTkFont(family="DejaVu Sans", size=22, weight="bold")
+        self.body_font = ctk.CTkFont(family="DejaVu Sans", size=14)
+        self.small_font = ctk.CTkFont(family="DejaVu Sans", size=12)
+        self.metric_font = ctk.CTkFont(family="DejaVu Sans", size=28, weight="bold")
+
+        self.status_var = tk.StringVar(value="Locked. Enter the vault password to begin.")
+        self.key_status_var = tk.StringVar(value="Key: Locked")
+        self.model_status_var = tk.StringVar(value="Model: Checking local vault...")
+        self.hash_status_var = tk.StringVar(value="Hash: Not checked")
+        self.dashboard_vault_var = tk.StringVar(value="Locked")
+        self.dashboard_history_var = tk.StringVar(value="Locked")
+        self.dashboard_plaintext_var = tk.StringVar(value="0B")
+        self.history_search_var = tk.StringVar()
+        self.settings_entropy_var = tk.BooleanVar(value=bool(self.settings_data.get("include_system_entropy", True)))
+        self.settings_delete_plaintext_var = tk.BooleanVar(
+            value=bool(self.settings_data.get("delete_plaintext_after_encrypt", True))
+        )
+        self.settings_memory_turns_var = tk.IntVar(value=int(self.settings_data.get("chat_memory_turns", 6)))
+        self.change_current_password_var = tk.StringVar()
+        self.change_new_password_var = tk.StringVar()
+        self.change_confirm_password_var = tk.StringVar()
+
+        self.title("Humoid Gemma Studio")
+        self.geometry("1420x940")
+        self.minsize(1260, 860)
+        self.configure(fg_color=PALETTE["window"])
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.background = tk.Canvas(self, bg=PALETTE["canvas"], highlightthickness=0, bd=0)
+        self.background.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.bind("<Configure>", self.draw_background)
+
+        self.shell = ctk.CTkFrame(self, fg_color="transparent")
+        self.shell.pack(fill="both", expand=True, padx=24, pady=24)
+
+        self.action_widgets: List[Any] = []
+        self.progress_mode = "indeterminate"
+
+        self.build_layout()
+        self.after(120, self.draw_background)
+        self.after(150, self.open_startup_dialog)
+        self.after(120, self.process_task_queue)
+
+    def build_layout(self) -> None:
+        self.shell.grid_columnconfigure(0, weight=1)
+        self.shell.grid_rowconfigure(1, weight=1)
+
+        self.hero = ctk.CTkFrame(
+            self.shell,
+            fg_color=PALETTE["panel"],
+            corner_radius=28,
+            border_width=1,
+            border_color=PALETTE["line"],
+        )
+        self.hero.grid(row=0, column=0, sticky="nsew", pady=(0, 18))
+        self.hero.grid_columnconfigure(0, weight=1)
+        self.hero.grid_columnconfigure(1, weight=0)
+
+        left = ctk.CTkFrame(self.hero, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=24, pady=20)
+
+        ctk.CTkLabel(
+            left,
+            text="Humoid Gemma Studio",
+            font=self.title_font,
+            text_color=PALETTE["text"],
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            left,
+            text="A colorful local control room for your encrypted Gemma model, chat vault, and road scanner workflows.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 18))
+
+        chips = ctk.CTkFrame(left, fg_color="transparent")
+        chips.pack(anchor="w")
+        self.make_chip(chips, self.key_status_var, PALETTE["accent_orange"]).pack(side="left", padx=(0, 10))
+        self.make_chip(chips, self.model_status_var, PALETTE["accent_teal"]).pack(side="left", padx=(0, 10))
+        self.make_chip(chips, self.hash_status_var, PALETTE["accent_blue"]).pack(side="left")
+
+        right = ctk.CTkFrame(self.hero, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="ne", padx=24, pady=20)
+
+        self.progress_bar = ctk.CTkProgressBar(
+            right,
+            width=280,
+            height=16,
+            mode="indeterminate",
+            fg_color="#efd8c8",
+            progress_color=PALETTE["accent_orange"],
+        )
+        self.progress_bar.pack(anchor="e", pady=(6, 12))
+        self.progress_bar.stop()
+        self.progress_bar.set(0)
+
+        ctk.CTkLabel(
+            right,
+            textvariable=self.status_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="right",
+            wraplength=280,
+        ).pack(anchor="e")
+
+        self.tabview = ctk.CTkTabview(
+            self.shell,
+            fg_color=PALETTE["panel"],
+            corner_radius=26,
+            border_width=1,
+            border_color=PALETTE["line"],
+            segmented_button_fg_color=PALETTE["panel_alt"],
+            segmented_button_selected_color=PALETTE["accent_orange"],
+            segmented_button_selected_hover_color="#f46445",
+            segmented_button_unselected_color="#f6e4d2",
+            segmented_button_unselected_hover_color="#f0dac2",
+            text_color=PALETTE["text"],
+            anchor="n",
+        )
+        self.tabview.grid(row=1, column=0, sticky="nsew")
+
+        self.dashboard_tab = self.tabview.add("Dashboard")
+        self.chat_tab = self.tabview.add("Chat")
+        self.model_tab = self.tabview.add("Model Lab")
+        self.road_tab = self.tabview.add("Road Scanner")
+        self.history_tab = self.tabview.add("History")
+        self.settings_tab = self.tabview.add("Settings")
+
+        for tab in (
+            self.dashboard_tab,
+            self.chat_tab,
+            self.model_tab,
+            self.road_tab,
+            self.history_tab,
+            self.settings_tab,
+        ):
+            tab.grid_columnconfigure(0, weight=1)
+
+        self.build_dashboard_tab()
+        self.build_chat_tab()
+        self.build_model_tab()
+        self.build_road_tab()
+        self.build_history_tab()
+        self.build_settings_tab()
+        self.set_action_state(False)
+
+    def draw_background(self, _event: Optional[Any] = None) -> None:
+        width = max(1, self.winfo_width())
+        height = max(1, self.winfo_height())
+        self.background.delete("all")
+        self.background.create_rectangle(0, 0, width, height, fill=PALETTE["canvas"], outline="")
+        self.background.create_oval(-120, -80, width * 0.42, height * 0.48, fill="#ffd7c2", outline="")
+        self.background.create_oval(width * 0.48, -130, width + 160, height * 0.44, fill="#d6f6ea", outline="")
+        self.background.create_oval(width * 0.18, height * 0.42, width * 0.88, height + 140, fill="#ffe9b8", outline="")
+        self.background.create_oval(width * 0.62, height * 0.34, width + 120, height + 90, fill="#d9efff", outline="")
+        self.background.create_oval(-60, height * 0.54, width * 0.36, height + 120, fill="#ffe2f3", outline="")
+
+    def make_chip(self, parent: Any, variable: tk.StringVar, color: str) -> ctk.CTkLabel:
+        return ctk.CTkLabel(
+            parent,
+            textvariable=variable,
+            font=self.small_font,
+            text_color=PALETTE["text"],
+            fg_color=color,
+            corner_radius=16,
+            padx=12,
+            pady=6,
+        )
+
+    def make_button(
+        self,
+        parent: Any,
+        text: str,
+        command: Callable[[], None],
+        palette_index: int,
+        *,
+        width: int = 170,
+        height: int = 44,
+    ) -> ctk.CTkButton:
+        fg_color, hover_color = TIE_DYE[palette_index % len(TIE_DYE)]
+        button = ctk.CTkButton(
+            parent,
+            text=text,
+            command=command,
+            width=width,
+            height=height,
+            corner_radius=18,
+            fg_color=fg_color,
+            hover_color=hover_color,
+            text_color="#fffdf8",
+            border_width=1,
+            border_color="#ffffff",
+            font=ctk.CTkFont(family="DejaVu Sans", size=13, weight="bold"),
+        )
+        return button
+
+    def register_action(self, widget: Any) -> Any:
+        self.action_widgets.append(widget)
+        return widget
+
+    def set_action_state(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for widget in self.action_widgets:
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+
+    def set_busy(self, busy: bool, label: Optional[str] = None) -> None:
+        self.busy = busy
+        self.set_action_state(not busy and self.key is not None)
+        if label:
+            self.status_var.set(label)
+        if busy:
+            self.progress_mode = "indeterminate"
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start()
+        else:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate")
+            self.progress_bar.set(0)
+
+    def open_startup_dialog(self) -> None:
+        dialog = StartupPasswordDialog(self)
+        dialog.wait_visibility()
+        dialog.focus_force()
+
+    def complete_unlock(self, key: bytes, key_mode: str) -> None:
+        self.key = key
+        self.key_mode = key_mode
+        self.key_status_var.set(f"Key: {'Passphrase' if key_mode == 'passphrase' else 'Legacy Raw'}")
+        self.status_var.set("Studio unlocked. The vault is ready.")
+        self.set_action_state(True)
+        try:
+            init_db(key)
+        except Exception as exc:
+            self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}")
+        self.refresh_dashboard()
+
+    def ensure_unlocked(self) -> bool:
+        if self.key is not None:
+            return True
+        self.status_var.set("The studio is locked. Unlock it first.")
+        if messagebox:
+            messagebox.showinfo("Vault Locked", "Unlock the studio before running model or history actions.")
+        return False
+
+    def run_task(
+        self,
+        label: str,
+        task: Callable[[Callable[[str, Any], None]], Any],
+        *,
+        on_success: Optional[Callable[[Any], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ) -> None:
+        if self.busy:
+            if messagebox:
+                messagebox.showinfo("One task at a time", "A background job is already running.")
+            return
+
+        self.set_busy(True, label)
+
+        def reporter(kind: str, payload: Any) -> None:
+            self.task_queue.put(("report", kind, payload))
+
+        def worker() -> None:
+            try:
+                result = task(reporter)
+            except Exception as exc:
+                self.task_queue.put(("error", exc, on_error))
+                return
+            self.task_queue.put(("success", result, on_success))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def process_task_queue(self) -> None:
+        try:
+            while True:
+                event = self.task_queue.get_nowait()
+                kind = event[0]
+
+                if kind == "report":
+                    _, report_kind, payload = event
+                    if report_kind == "status":
+                        self.status_var.set(str(payload))
+                    elif report_kind == "progress":
+                        if self.progress_mode != "determinate":
+                            self.progress_mode = "determinate"
+                            self.progress_bar.stop()
+                            self.progress_bar.configure(mode="determinate")
+                        self.progress_bar.set(float(payload))
+
+                elif kind == "success":
+                    _, result, callback = event
+                    self.set_busy(False)
+                    self.refresh_dashboard()
+                    if callback:
+                        callback(result)
+                    elif self.status_var.get() == "":
+                        self.status_var.set("Task completed.")
+
+                elif kind == "error":
+                    _, exc, callback = event
+                    self.set_busy(False)
+                    self.refresh_dashboard()
+                    if callback:
+                        callback(exc)
+                    else:
+                        self.status_var.set(str(exc))
+                        if messagebox:
+                            messagebox.showerror("Task failed", str(exc))
+        except Exception:
+            pass
+
+        self.after(120, self.process_task_queue)
+
+    def build_dashboard_tab(self) -> None:
+        tab = self.dashboard_tab
+        tab.grid_columnconfigure((0, 1, 2), weight=1)
+
+        top_card = ctk.CTkFrame(
+            tab,
+            fg_color=PALETTE["card"],
+            corner_radius=24,
+            border_width=1,
+            border_color=PALETTE["line"],
+        )
+        top_card.grid(row=0, column=0, columnspan=3, sticky="ew", padx=20, pady=(20, 16))
+        top_card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            top_card,
+            text="Control Deck",
+            font=self.section_font,
+            text_color=PALETTE["text"],
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(18, 6))
+
+        ctk.CTkLabel(
+            top_card,
+            text="Fast launch actions for the secure parts of the app.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+        ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 18))
+
+        buttons = ctk.CTkFrame(top_card, fg_color="transparent")
+        buttons.grid(row=0, column=1, rowspan=2, sticky="e", padx=22, pady=18)
+
+        self.register_action(self.make_button(buttons, "Model Lab", lambda: self.tabview.set("Model Lab"), 0)).pack(
+            side="left", padx=(0, 10)
+        )
+        self.register_action(self.make_button(buttons, "Chat", lambda: self.tabview.set("Chat"), 2)).pack(
+            side="left", padx=(0, 10)
+        )
+        self.register_action(self.make_button(buttons, "Road Scanner", lambda: self.tabview.set("Road Scanner"), 4)).pack(
+            side="left"
+        )
+
+        self.metric_cards: Dict[str, tk.StringVar] = {}
+        cards = [
+            ("Vault State", self.dashboard_vault_var, PALETTE["accent_orange"]),
+            ("History Entries", self.dashboard_history_var, PALETTE["accent_teal"]),
+            ("Plaintext Copy", self.dashboard_plaintext_var, PALETTE["accent_blue"]),
+        ]
+        for idx, (title, variable, accent) in enumerate(cards):
+            card = ctk.CTkFrame(
+                tab,
+                fg_color=PALETTE["card"],
+                corner_radius=22,
+                border_width=1,
+                border_color=accent,
+            )
+            card.grid(row=1, column=idx, sticky="nsew", padx=(20 if idx == 0 else 10, 20 if idx == 2 else 10), pady=(0, 16))
+            ctk.CTkLabel(card, text=title, font=self.small_font, text_color=PALETTE["muted"]).pack(anchor="w", padx=20, pady=(16, 10))
+            ctk.CTkLabel(card, textvariable=variable, font=self.metric_font, text_color=PALETTE["text"]).pack(
+                anchor="w", padx=20, pady=(0, 18)
+            )
+
+        mood = ctk.CTkFrame(
+            tab,
+            fg_color=PALETTE["card_soft"],
+            corner_radius=22,
+            border_width=1,
+            border_color=PALETTE["line"],
+        )
+        mood.grid(row=2, column=0, columnspan=3, sticky="nsew", padx=20, pady=(0, 20))
+
+        ctk.CTkLabel(mood, text="Studio Mood", font=self.section_font, text_color=PALETTE["text"]).pack(
+            anchor="w", padx=22, pady=(18, 8)
+        )
+        ctk.CTkLabel(
+            mood,
+            text=(
+                "Tie-dye bright buttons, a warm glassy background, and a passphrase-first startup flow. "
+                "Heavy work stays off the UI thread so the interface keeps breathing while downloads, "
+                "hash checks, and inference jobs run."
+            ),
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=1180,
+        ).pack(anchor="w", padx=22, pady=(0, 20))
+
+    def build_chat_tab(self) -> None:
+        tab = self.chat_tab
+        tab.grid_columnconfigure(0, weight=4)
+        tab.grid_columnconfigure(1, weight=2)
+        tab.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        left.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        left.grid_rowconfigure(2, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="Chat", font=self.section_font, text_color=PALETTE["text"]).grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 6)
+        )
+        ctk.CTkLabel(
+            left,
+            text="Each prompt runs locally and re-seals the model vault when the response finishes.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 12))
+
+        self.chat_output = ctk.CTkTextbox(
+            left,
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            corner_radius=20,
+            border_width=1,
+            border_color=PALETTE["line"],
+            font=self.body_font,
+            wrap="word",
+        )
+        self.chat_output.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 16))
+        self.chat_output.insert(
+            "1.0",
+            "Humoid Gemma Studio is ready for local prompts once the vault is unlocked.\n\n",
+        )
+        self.chat_output.configure(state="disabled")
+        self.configure_textbox_tags(self.chat_output)
+
+        compose = ctk.CTkFrame(left, fg_color="transparent")
+        compose.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
+        compose.grid_columnconfigure(0, weight=1)
+
+        self.chat_input = ctk.CTkTextbox(
+            compose,
+            height=110,
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            corner_radius=18,
+            border_width=1,
+            border_color=PALETTE["line"],
+            font=self.body_font,
+            wrap="word",
+        )
+        self.chat_input.grid(row=0, column=0, sticky="ew")
+        self.register_action(self.chat_input)
+
+        actions = ctk.CTkFrame(compose, fg_color="transparent")
+        actions.grid(row=0, column=1, sticky="ns", padx=(14, 0))
+
+        send_button = self.make_button(actions, "Send Prompt", self.submit_chat, 1, width=150, height=46)
+        send_button.pack(pady=(0, 10))
+        self.register_action(send_button)
+
+        clear_button = self.make_button(actions, "Clear Chat", self.clear_chat, 3, width=150, height=42)
+        clear_button.pack()
+        self.register_action(clear_button)
+
+        right = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(right, text="Session Memory", font=self.section_font, text_color=PALETTE["text"]).grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 6)
+        )
+        ctk.CTkLabel(
+            right,
+            text="Recent turns are tucked into each prompt so the chat feels conversational even though the model is reopened per request.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+            wraplength=320,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 14))
+
+        self.memory_preview = ctk.CTkTextbox(
+            right,
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            corner_radius=18,
+            border_width=1,
+            border_color=PALETTE["line"],
+            font=self.small_font,
+            wrap="word",
+            height=320,
+        )
+        self.memory_preview.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 16))
+        self.memory_preview.insert("1.0", "No turns yet.\n")
+        self.memory_preview.configure(state="disabled")
+
+        hint = ctk.CTkLabel(
+            right,
+            text="Tip: keep prompts short and concrete for faster local responses.",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=320,
+        )
+        hint.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 20))
+
+    def build_model_tab(self) -> None:
+        tab = self.model_tab
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
+
+        left = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        left.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        left.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="Model Vault", font=self.section_font, text_color=PALETTE["text"]).grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 6)
+        )
+        ctk.CTkLabel(
+            left,
+            text="Download, verify, and seal the LiteRT-LM model without keeping loose plaintext around.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+            wraplength=520,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 18))
+
+        button_row = ctk.CTkFrame(left, fg_color="transparent")
+        button_row.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 14))
+
+        download_button = self.make_button(button_row, "Download + Encrypt", self.download_model_action, 0, width=180)
+        download_button.pack(side="left", padx=(0, 10))
+        self.register_action(download_button)
+
+        verify_button = self.make_button(button_row, "Verify Hash", self.verify_model_action, 2, width=150)
+        verify_button.pack(side="left", padx=(0, 10))
+        self.register_action(verify_button)
+
+        encrypt_button = self.make_button(button_row, "Encrypt Plaintext", self.encrypt_plaintext_action, 4, width=170)
+        encrypt_button.pack(side="left")
+        self.register_action(encrypt_button)
+
+        button_row_2 = ctk.CTkFrame(left, fg_color="transparent")
+        button_row_2.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+
+        delete_plain_button = self.make_button(button_row_2, "Delete Plaintext", self.delete_plaintext_action, 5, width=170)
+        delete_plain_button.pack(side="left")
+        self.register_action(delete_plain_button)
+
+        self.model_notes = ctk.CTkTextbox(
+            left,
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            corner_radius=18,
+            border_width=1,
+            border_color=PALETTE["line"],
+            font=self.body_font,
+            wrap="word",
+        )
+        self.model_notes.grid(row=4, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        self.model_notes.insert(
+            "1.0",
+            "Safe defaults:\n"
+            "- Downloads land in a temporary file first.\n"
+            "- Hash mismatches are rejected automatically.\n"
+            "- Encryption uses a streamed format so large model files do not have to live fully in memory.\n",
+        )
+        self.model_notes.configure(state="disabled")
+
+        right = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+
+        ctk.CTkLabel(right, text="Local Storage", font=self.section_font, text_color=PALETTE["text"]).pack(
+            anchor="w", padx=20, pady=(18, 6)
+        )
+        ctk.CTkLabel(
+            right,
+            text="A quick read on what is stored locally right now.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+        ).pack(anchor="w", padx=20, pady=(0, 18))
+
+        self.model_status_box = ctk.CTkTextbox(
+            right,
+            height=260,
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            corner_radius=18,
+            border_width=1,
+            border_color=PALETTE["line"],
+            font=self.body_font,
+            wrap="word",
+        )
+        self.model_status_box.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.model_status_box.configure(state="disabled")
+
+    def build_road_tab(self) -> None:
+        tab = self.road_tab
+        tab.grid_columnconfigure(0, weight=3)
+        tab.grid_columnconfigure(1, weight=2)
+
+        form = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        form.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        form.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Road Scanner", font=self.section_font, text_color=PALETTE["text"]).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(18, 6)
+        )
+        ctk.CTkLabel(
+            form,
+            text="Fill in the scene details and let the local model classify the driving risk.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 18))
+
+        fields = [
+            ("location", "Location", "I-95 NB mile 12"),
+            ("road_type", "Road Type", "highway"),
+            ("weather", "Weather", "clear"),
+            ("traffic", "Traffic", "medium"),
+            ("obstacles", "Obstacles", "none"),
+            ("sensor_notes", "Sensor Notes", "camera and lidar stable"),
+        ]
+        self.road_inputs: Dict[str, Any] = {}
+        for row_index, (name, label, placeholder) in enumerate(fields, start=2):
+            ctk.CTkLabel(form, text=label, font=self.small_font, text_color=PALETTE["muted"]).grid(
+                row=row_index, column=0, sticky="w", padx=20, pady=(0, 10)
+            )
+            entry = ctk.CTkEntry(
+                form,
+                placeholder_text=placeholder,
+                height=42,
+                corner_radius=16,
+                border_color=PALETTE["line"],
+                fg_color=PALETTE["panel_alt"],
+                text_color=PALETTE["text"],
+                font=self.body_font,
+            )
+            entry.grid(row=row_index, column=1, sticky="ew", padx=20, pady=(0, 10))
+            self.register_action(entry)
+            self.road_inputs[name] = entry
+
+        road_buttons = ctk.CTkFrame(form, fg_color="transparent")
+        road_buttons.grid(row=8, column=0, columnspan=2, sticky="w", padx=20, pady=(6, 20))
+
+        run_button = self.make_button(road_buttons, "Run Scan", self.run_road_scan_action, 1, width=150)
+        run_button.pack(side="left", padx=(0, 10))
+        self.register_action(run_button)
+
+        export_button = self.make_button(road_buttons, "Export JSON", self.export_last_scan, 3, width=150)
+        export_button.pack(side="left")
+        self.register_action(export_button)
+        export_button.configure(state="disabled")
+        self.road_export_button = export_button
+
+        result = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        result.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        result.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(result, text="Scan Result", font=self.section_font, text_color=PALETTE["text"]).grid(
+            row=0, column=0, sticky="w", padx=20, pady=(18, 10)
+        )
+
+        self.road_result_label = ctk.CTkLabel(
+            result,
+            text="Waiting for a scan",
+            font=ctk.CTkFont(family="DejaVu Sans", size=34, weight="bold"),
+            text_color=PALETTE["accent_indigo"],
+            fg_color=PALETTE["panel_alt"],
+            corner_radius=18,
+            padx=18,
+            pady=18,
+        )
+        self.road_result_label.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 16))
+
+        self.road_detail_box = ctk.CTkTextbox(
+            result,
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            corner_radius=18,
+            border_width=1,
+            border_color=PALETTE["line"],
+            font=self.small_font,
+            wrap="word",
+        )
+        self.road_detail_box.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        self.road_detail_box.insert("1.0", "Prompt and raw model output will appear here.\n")
+        self.road_detail_box.configure(state="disabled")
+
+    def build_history_tab(self) -> None:
+        tab = self.history_tab
+        controls = ctk.CTkFrame(tab, fg_color="transparent")
+        controls.pack(fill="x", padx=20, pady=(20, 14))
+
+        self.history_search_entry = ctk.CTkEntry(
+            controls,
+            textvariable=self.history_search_var,
+            placeholder_text="Search prompts or responses",
+            height=44,
+            corner_radius=16,
+            border_color=PALETTE["line"],
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            font=self.body_font,
+            width=360,
+        )
+        self.history_search_entry.pack(side="left", padx=(0, 10))
+        self.register_action(self.history_search_entry)
+
+        refresh_history = self.make_button(controls, "Refresh", self.refresh_history_action, 2, width=130, height=42)
+        refresh_history.pack(side="left", padx=(0, 10))
+        self.register_action(refresh_history)
+
+        prev_history = self.make_button(controls, "Previous", self.history_prev_page, 4, width=130, height=42)
+        prev_history.pack(side="left", padx=(0, 10))
+        self.register_action(prev_history)
+
+        next_history = self.make_button(controls, "Next", self.history_next_page, 5, width=110, height=42)
+        next_history.pack(side="left")
+        self.register_action(next_history)
+
+        self.history_box = ctk.CTkTextbox(
+            tab,
+            fg_color=PALETTE["card"],
+            text_color=PALETTE["text"],
+            corner_radius=24,
+            border_width=1,
+            border_color=PALETTE["line"],
+            font=self.body_font,
+            wrap="word",
+        )
+        self.history_box.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.history_box.insert("1.0", "Unlock the vault, then refresh to browse encrypted history.\n")
+        self.history_box.configure(state="disabled")
+
+    def build_settings_tab(self) -> None:
+        tab = self.settings_tab
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
+
+        look = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        look.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+
+        ctk.CTkLabel(look, text="Behavior", font=self.section_font, text_color=PALETTE["text"]).pack(
+            anchor="w", padx=20, pady=(18, 8)
+        )
+
+        entropy_switch = ctk.CTkSwitch(
+            look,
+            text="Include live system entropy in road scanner prompts",
+            variable=self.settings_entropy_var,
+            progress_color=PALETTE["accent_teal"],
+            button_color=PALETTE["accent_teal"],
+            button_hover_color="#008c69",
+            text_color=PALETTE["text"],
+            font=self.body_font,
+        )
+        entropy_switch.pack(anchor="w", padx=20, pady=(0, 12))
+        self.register_action(entropy_switch)
+
+        delete_switch = ctk.CTkSwitch(
+            look,
+            text="Delete plaintext model copy after manual encryption",
+            variable=self.settings_delete_plaintext_var,
+            progress_color=PALETTE["accent_blue"],
+            button_color=PALETTE["accent_blue"],
+            button_hover_color="#0b79bf",
+            text_color=PALETTE["text"],
+            font=self.body_font,
+        )
+        delete_switch.pack(anchor="w", padx=20, pady=(0, 12))
+        self.register_action(delete_switch)
+
+        memory_label = ctk.CTkLabel(
+            look,
+            text="Chat memory turns",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        )
+        memory_label.pack(anchor="w", padx=20, pady=(4, 4))
+
+        memory_slider = ctk.CTkSlider(
+            look,
+            from_=2,
+            to=10,
+            number_of_steps=8,
+            variable=self.settings_memory_turns_var,
+            progress_color=PALETTE["accent_pink"],
+            button_color=PALETTE["accent_pink"],
+            button_hover_color="#cf4d9b",
+        )
+        memory_slider.pack(fill="x", padx=20, pady=(0, 12))
+        self.register_action(memory_slider)
+
+        save_button = self.make_button(look, "Save Settings", self.save_settings_action, 0, width=160)
+        save_button.pack(anchor="w", padx=20, pady=(0, 20))
+        self.register_action(save_button)
+
+        security = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        security.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+
+        ctk.CTkLabel(security, text="Vault Password", font=self.section_font, text_color=PALETTE["text"]).pack(
+            anchor="w", padx=20, pady=(18, 8)
+        )
+        ctk.CTkLabel(
+            security,
+            text="Change the password protecting the encrypted model and chat history.",
+            font=self.body_font,
+            text_color=PALETTE["muted"],
+            wraplength=500,
+            justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 16))
+
+        self.current_password_entry = ctk.CTkEntry(
+            security,
+            textvariable=self.change_current_password_var,
+            show="*",
+            placeholder_text="Current password (leave blank for legacy raw mode)",
+            height=42,
+            corner_radius=16,
+            border_color=PALETTE["line"],
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            font=self.body_font,
+        )
+        self.current_password_entry.pack(fill="x", padx=20, pady=(0, 10))
+        self.register_action(self.current_password_entry)
+
+        self.new_password_entry = ctk.CTkEntry(
+            security,
+            textvariable=self.change_new_password_var,
+            show="*",
+            placeholder_text="New password",
+            height=42,
+            corner_radius=16,
+            border_color=PALETTE["line"],
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            font=self.body_font,
+        )
+        self.new_password_entry.pack(fill="x", padx=20, pady=(0, 10))
+        self.register_action(self.new_password_entry)
+
+        self.confirm_password_entry = ctk.CTkEntry(
+            security,
+            textvariable=self.change_confirm_password_var,
+            show="*",
+            placeholder_text="Confirm new password",
+            height=42,
+            corner_radius=16,
+            border_color=PALETTE["line"],
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            font=self.body_font,
+        )
+        self.confirm_password_entry.pack(fill="x", padx=20, pady=(0, 14))
+        self.register_action(self.confirm_password_entry)
+
+        password_button = self.make_button(security, "Update Password", self.change_password_action, 1, width=180)
+        password_button.pack(anchor="w", padx=20, pady=(0, 10))
+        self.register_action(password_button)
+
+        lock_button = self.make_button(security, "Lock Studio", self.lock_studio, 5, width=140)
+        lock_button.pack(anchor="w", padx=20, pady=(0, 20))
+        self.register_action(lock_button)
+
+    def configure_textbox_tags(self, textbox: ctk.CTkTextbox) -> None:
+        try:
+            text_widget = textbox._textbox
+            text_widget.tag_config("user_header", foreground=PALETTE["accent_orange"], font=("DejaVu Sans", 11, "bold"))
+            text_widget.tag_config("assistant_header", foreground=PALETTE["accent_teal"], font=("DejaVu Sans", 11, "bold"))
+            text_widget.tag_config("meta", foreground=PALETTE["muted"], font=("DejaVu Sans", 10))
+        except Exception:
+            return
+
+    def append_chat_message(self, role: str, message: str) -> None:
+        self.chat_output.configure(state="normal")
+        tag = "user_header" if role == "You" else "assistant_header"
+        timestamp = time.strftime("%H:%M:%S")
+        try:
+            text_widget = self.chat_output._textbox
+            text_widget.insert("end", f"{role}  {timestamp}\n", (tag,))
+            text_widget.insert("end", message.strip() + "\n\n")
+            text_widget.see("end")
+        except Exception:
+            self.chat_output.insert("end", f"{role}  {timestamp}\n{message.strip()}\n\n")
+        self.chat_output.configure(state="disabled")
+
+    def refresh_memory_preview(self) -> None:
+        self.memory_preview.configure(state="normal")
+        self.memory_preview.delete("1.0", "end")
+        if not self.chat_memory:
+            self.memory_preview.insert("1.0", "No turns yet.\n")
+        else:
+            for role, message in self.chat_memory[-12:]:
+                label = "You" if role == "user" else "Gemma"
+                self.memory_preview.insert("end", f"{label}: {message}\n\n")
+        self.memory_preview.configure(state="disabled")
+
+    def refresh_dashboard(self) -> None:
+        summary = storage_summary(self.key)
+        self.model_status_var.set(f"Model: {summary['model_state']}")
+        self.dashboard_vault_var.set(summary["encrypted_size"])
+        self.dashboard_history_var.set(summary["history_count"])
+        self.dashboard_plaintext_var.set(summary["plaintext_size"])
+        self.update_model_status_box(summary)
+
+    def update_model_status_box(self, summary: Dict[str, str]) -> None:
+        lines = [
+            f"Model state: {summary['model_state']}",
+            f"Encrypted size: {summary['encrypted_size']}",
+            f"Plaintext size: {summary['plaintext_size']}",
+            f"Key mode: {summary['key_mode']}",
+            f"Expected SHA256: {EXPECTED_HASH}",
+            "",
+            "Safety notes:",
+            "- Runtime model access uses a temporary unlocked file when the encrypted vault exists.",
+            "- Chat history lives in an encrypted SQLite file and is re-sealed after each read or write.",
+            "- Password changes re-encrypt the model vault and history vault before the key file is replaced.",
+        ]
+        self.model_status_box.configure(state="normal")
+        self.model_status_box.delete("1.0", "end")
+        self.model_status_box.insert("1.0", "\n".join(lines))
+        self.model_status_box.configure(state="disabled")
+
+    def clear_chat(self) -> None:
+        self.chat_memory.clear()
+        self.chat_output.configure(state="normal")
+        self.chat_output.delete("1.0", "end")
+        self.chat_output.insert("1.0", "Chat cleared. The local vault is still ready.\n\n")
+        self.chat_output.configure(state="disabled")
+        self.refresh_memory_preview()
+
+    def submit_chat(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        prompt = self.chat_input.get("1.0", "end").strip()
+        if not prompt:
+            return
+
+        memory_snapshot = list(self.chat_memory)
+        memory_turns = int(self.settings_data.get("chat_memory_turns", 6))
+        self.append_chat_message("You", prompt)
+        self.chat_input.delete("1.0", "end")
+        self.status_var.set("Sending prompt to the local model...")
+
+        def on_success(reply: str) -> None:
+            self.chat_memory.extend([("user", prompt), ("assistant", reply)])
+            self.append_chat_message("Gemma", reply)
+            self.refresh_memory_preview()
+            self.status_var.set("Reply ready. The model vault has been sealed again.")
+
+        self.run_task(
+            "Generating a local reply...",
+            lambda reporter: run_chat_request(self.key, prompt, memory_snapshot, memory_turns),
+            on_success=on_success,
+        )
+
+    def download_model_action(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        if messagebox and not messagebox.askyesno(
+            "Download model",
+            "Download the Gemma LiteRT-LM model, verify its hash, and seal it into the encrypted vault?",
+        ):
+            return
+
+        def on_success(sha: str) -> None:
+            self.hash_status_var.set(f"Hash: Verified {sha[:12]}...")
+            self.status_var.set("Model download finished and the encrypted vault is ready.")
+
+        self.run_task(
+            "Downloading and sealing the model vault...",
+            lambda reporter: download_and_encrypt_model(self.key, reporter=reporter),
+            on_success=on_success,
+        )
+
+    def verify_model_action(self) -> None:
+        if not self.ensure_unlocked():
+            return
+
+        def on_success(result: Tuple[str, bool]) -> None:
+            sha, matches = result
+            status = "Verified" if matches else "Mismatch"
+            self.hash_status_var.set(f"Hash: {status} {sha[:12]}...")
+            if messagebox:
+                if matches:
+                    messagebox.showinfo("Hash verified", f"SHA256 matches the expected model hash.\n\n{sha}")
+                else:
+                    messagebox.showwarning("Hash mismatch", f"The model hash does not match the expected value.\n\n{sha}")
+
+        self.run_task(
+            "Verifying the local model hash...",
+            lambda reporter: verify_model_hash(self.key),
+            on_success=on_success,
+        )
+
+    def encrypt_plaintext_action(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        delete_plaintext = bool(self.settings_delete_plaintext_var.get())
+
+        def on_success(_: Any) -> None:
+            self.status_var.set("Plaintext model encrypted into the vault.")
+
+        self.run_task(
+            "Encrypting the plaintext model copy...",
+            lambda reporter: encrypt_existing_plaintext_model(self.key, delete_plaintext=delete_plaintext),
+            on_success=on_success,
+        )
+
+    def delete_plaintext_action(self) -> None:
+        if not MODEL_PATH.exists():
+            if messagebox:
+                messagebox.showinfo("No plaintext copy", "There is no plaintext model file to remove.")
+            return
+        if messagebox and not messagebox.askyesno(
+            "Delete plaintext model",
+            "Delete the plaintext model copy from disk? The encrypted vault will remain untouched.",
+        ):
+            return
+        safe_cleanup([MODEL_PATH])
+        self.status_var.set("Plaintext model copy removed.")
+        self.refresh_dashboard()
+
+    def collect_road_form(self) -> Dict[str, str]:
+        data: Dict[str, str] = {}
+        defaults = {
+            "location": "unspecified location",
+            "road_type": "highway",
+            "weather": "clear",
+            "traffic": "medium",
+            "obstacles": "none",
+            "sensor_notes": "none",
+        }
+        for key, widget in self.road_inputs.items():
+            value = widget.get().strip()
+            data[key] = value or defaults[key]
+        return data
+
+    def run_road_scan_action(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        data = self.collect_road_form()
+        include_entropy = bool(self.settings_data.get("include_system_entropy", True))
+
+        def on_success(result: Dict[str, str]) -> None:
+            self.last_scan_result = dict(result)
+            label = result["label"]
+            color = PALETTE["ok"] if label == "Low" else PALETTE["accent_gold"] if label == "Medium" else PALETTE["danger"]
+            self.road_result_label.configure(text=label, text_color=color)
+            self.road_detail_box.configure(state="normal")
+            self.road_detail_box.delete("1.0", "end")
+            self.road_detail_box.insert(
+                "1.0",
+                f"Timestamp: {result['timestamp']}\n\nPrompt:\n{result['prompt']}\n\nRaw model output:\n{result['raw']}\n",
+            )
+            self.road_detail_box.configure(state="disabled")
+            self.road_export_button.configure(state="normal")
+            self.status_var.set("Road scan complete. The result has been logged into the encrypted history vault.")
+
+        self.run_task(
+            "Running the road scanner locally...",
+            lambda reporter: run_road_scan(self.key, data, include_entropy),
+            on_success=on_success,
+        )
+
+    def export_last_scan(self) -> None:
+        if not self.last_scan_result:
+            return
+        if filedialog is None:
+            if messagebox:
+                messagebox.showwarning("Export unavailable", "File dialog support is not available in this environment.")
+            return
+        suggested = f"road_scan_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        target = filedialog.asksaveasfilename(
+            title="Export road scan result",
+            initialfile=suggested,
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not target:
+            return
+        Path(target).write_text(json.dumps(self.last_scan_result, indent=2), encoding="utf-8")
+        self.status_var.set(f"Road scan exported to {target}.")
+
+    def refresh_history_action(self) -> None:
+        self.history_offset = 0
+        self.load_history_page()
+
+    def history_next_page(self) -> None:
+        self.history_offset += 12
+        self.load_history_page()
+
+    def history_prev_page(self) -> None:
+        self.history_offset = max(0, self.history_offset - 12)
+        self.load_history_page()
+
+    def load_history_page(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        search = self.history_search_var.get().strip() or None
+        offset_snapshot = self.history_offset
+
+        def on_success(rows: List[Tuple[int, str, str, str]]) -> None:
+            if not rows and offset_snapshot > 0:
+                self.history_offset = max(0, offset_snapshot - 12)
+            self.render_history(rows, search)
+
+        self.run_task(
+            "Loading encrypted history...",
+            lambda reporter: fetch_history(self.key, limit=12, offset=offset_snapshot, search=search),
+            on_success=on_success,
+        )
+
+    def render_history(self, rows: List[Tuple[int, str, str, str]], search: Optional[str]) -> None:
+        self.history_box.configure(state="normal")
+        self.history_box.delete("1.0", "end")
+        header = f"Search: {search or 'None'}\nOffset: {self.history_offset}\n\n"
+        self.history_box.insert("1.0", header)
+        if not rows:
+            self.history_box.insert("end", "No history rows for this page.\n")
+        else:
+            for row_id, stamp, prompt, response in rows:
+                self.history_box.insert(
+                    "end",
+                    f"[{row_id}] {stamp}\nPrompt:\n{prompt}\n\nResponse:\n{response}\n\n{'-' * 72}\n\n",
+                )
+        self.history_box.configure(state="disabled")
+        self.status_var.set("Encrypted history loaded.")
+
+    def save_settings_action(self) -> None:
+        self.settings_data["include_system_entropy"] = bool(self.settings_entropy_var.get())
+        self.settings_data["delete_plaintext_after_encrypt"] = bool(self.settings_delete_plaintext_var.get())
+        self.settings_data["chat_memory_turns"] = int(self.settings_memory_turns_var.get())
+        save_settings(self.settings_data)
+        self.status_var.set("Settings saved.")
+
+    def change_password_action(self) -> None:
+        if not self.ensure_unlocked():
+            return
+
+        current_password = self.change_current_password_var.get().strip()
+        new_password = self.change_new_password_var.get().strip()
+        confirm_password = self.change_confirm_password_var.get().strip()
+
+        if len(new_password) < 8:
+            if messagebox:
+                messagebox.showwarning("Password too short", "Use at least 8 characters for the new vault password.")
+            return
+        if new_password != confirm_password:
+            if messagebox:
+                messagebox.showwarning("Mismatch", "The new password and confirmation do not match.")
+            return
+
+        if detect_key_mode() == "passphrase":
+            try:
+                unlock_key_with_passphrase(current_password)
+            except Exception as exc:
+                if messagebox:
+                    messagebox.showwarning("Current password incorrect", str(exc))
+                return
+
+        def on_success(new_key: bytes) -> None:
+            self.key = new_key
+            self.key_mode = "passphrase"
+            self.key_status_var.set("Key: Passphrase")
+            self.change_current_password_var.set("")
+            self.change_new_password_var.set("")
+            self.change_confirm_password_var.set("")
+            self.status_var.set("Vault password updated and encrypted assets were rewrapped safely.")
+
+        self.run_task(
+            "Re-encrypting the vault with the new password...",
+            lambda reporter: rotate_to_new_passphrase(self.key, new_password, reporter=reporter),
+            on_success=on_success,
+        )
+
+    def lock_studio(self) -> None:
+        self.key = None
+        self.key_mode = "locked"
+        self.key_status_var.set("Key: Locked")
+        self.model_status_var.set("Model: Locked")
+        self.status_var.set("Studio locked.")
+        self.hash_status_var.set("Hash: Not checked")
+        self.chat_memory.clear()
+        self.refresh_memory_preview()
+        self.set_action_state(False)
+        self.open_startup_dialog()
+
+    def on_close(self) -> None:
+        if self.busy:
+            if messagebox:
+                messagebox.showinfo("Task running", "Please wait for the current task to finish before closing the studio.")
+            return
+        if RUNTIME_MODEL_PATH.exists() and self.key is not None:
+            try:
+                encrypt_file(RUNTIME_MODEL_PATH, ENCRYPTED_MODEL, self.key)
+                safe_cleanup([RUNTIME_MODEL_PATH])
+            except Exception:
+                pass
+        self.destroy()
 
 
 def main() -> None:
-    try:
-        key = ensure_key_interactive()
-    except Exception:
-        key = get_or_create_key()
-    state = {"key": key, "model_loaded": False}
-    try:
-        asyncio.run(init_db(state["key"]))
-    except Exception:
-        pass
-    try:
-        main_menu_loop(state)
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-    finally:
-        show_cursor()
+    if tk is None or ctk is None:
+        missing = []
+        if tk is None:
+            missing.append("tkinter")
+        if ctk is None:
+            missing.append("customtkinter")
+        raise SystemExit(
+            "This app now launches as a GUI and requires "
+            + ", ".join(missing)
+            + ". Install the project dependencies and make sure Python Tk support is available."
+        )
+
+    app = HumoidStudioApp()
+    app.mainloop()
 
 
 if __name__ == "__main__":

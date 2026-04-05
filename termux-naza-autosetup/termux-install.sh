@@ -28,7 +28,7 @@ mkdir -p "$PROOT_TMP_DIR"
 echo "Setting up sudouser + Python + Humoid-Gui-Gemma repo..."
 proot-distro login ubuntu -- <<'EOF'
 apt update && apt upgrade -y
-apt install -y sudo python3 python3-pip python3-venv git nano curl
+apt install -y sudo python3 python3-pip python3-venv python3-tk git nano curl
 
 # Create sudouser (no password)
 adduser --disabled-password --gecos "" sudouser

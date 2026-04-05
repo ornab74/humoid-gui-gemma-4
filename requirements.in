@@ -4,3 +4,4 @@ aiosqlite==0.21.0
 cryptography==46.0.1
 psutil==6.1.1
 pennylane==0.41.0
+customtkinter==5.2.2

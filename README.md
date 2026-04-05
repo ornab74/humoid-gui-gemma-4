@@ -14,6 +14,14 @@ Humoid-Gui-Gemma is a terminal-first app focused on:
 
 ---
 
+# Screenshots
+
+### Humoid GUI - Gemma 4
+
+![Demo Screenshot](https://github.com/ornab74/humoid-gui-gemma-4/blob/main/demo.png)
+
+
+![Chat Running](https://github.com/ornab74/humoid-gui-gemma-4/blob/main/demo2.png)
 ## What it does
 
 Humoid-Gui-Gemma downloads a LiteRT-LM model, verifies its SHA256 checksum, encrypts it at rest, decrypts it only when needed, runs inference locally, then re-encrypts the model after use.

@@ -78,32 +78,32 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 PALETTE = {
-    "window": "#f8f2ea",
-    "canvas": "#fffaf6",
-    "panel": "#fff7ef",
-    "panel_alt": "#fff0df",
-    "card": "#fffdf9",
-    "card_soft": "#fceee2",
-    "text": "#1d2733",
-    "muted": "#5d6977",
-    "line": "#e6cbb3",
-    "accent_orange": "#ff7a59",
-    "accent_gold": "#ffb703",
-    "accent_teal": "#00b894",
-    "accent_blue": "#00a6fb",
-    "accent_pink": "#f15bb5",
-    "accent_indigo": "#4d7cff",
-    "danger": "#d9485f",
-    "ok": "#199c73",
+    "window": "#030604",
+    "canvas": "#07110a",
+    "panel": "#0b120d",
+    "panel_alt": "#111a14",
+    "card": "#0f1711",
+    "card_soft": "#162119",
+    "text": "#d6ffe1",
+    "muted": "#86a892",
+    "line": "#254130",
+    "accent_orange": "#39ff88",
+    "accent_gold": "#94ffb8",
+    "accent_teal": "#00d46a",
+    "accent_blue": "#1ecf7a",
+    "accent_pink": "#68ff9a",
+    "accent_indigo": "#4f6b57",
+    "danger": "#ff5470",
+    "ok": "#5cff9d",
 }
 
 TIE_DYE = [
-    ("#ff7a59", "#f56545"),
-    ("#ffb703", "#f29a05"),
-    ("#00b894", "#00a37d"),
-    ("#00a6fb", "#0287da"),
-    ("#f15bb5", "#d94aa2"),
-    ("#4d7cff", "#3e67d7"),
+    ("#39ff88", "#2de06f"),
+    ("#00d46a", "#00b85c"),
+    ("#1ecf7a", "#14b066"),
+    ("#68ff9a", "#4be783"),
+    ("#2b3830", "#1e2a22"),
+    ("#94ffb8", "#75e69a"),
 ]
 
 DEFAULT_SETTINGS = {
@@ -1037,13 +1037,13 @@ class HumoidStudioApp(AppBase):
         self.history_offset = 0
         self.active_process: Optional[mp.Process] = None
 
-        ctk.set_appearance_mode("light")
-        ctk.set_default_color_theme("blue")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("green")
 
-        self.title_font = ctk.CTkFont(family="DejaVu Serif", size=34, weight="bold")
-        self.section_font = ctk.CTkFont(family="DejaVu Sans", size=22, weight="bold")
+        self.title_font = ctk.CTkFont(family="DejaVu Sans Mono", size=32, weight="bold")
+        self.section_font = ctk.CTkFont(family="DejaVu Sans Mono", size=21, weight="bold")
         self.body_font = ctk.CTkFont(family="DejaVu Sans", size=14)
-        self.small_font = ctk.CTkFont(family="DejaVu Sans", size=12)
+        self.small_font = ctk.CTkFont(family="DejaVu Sans Mono", size=12)
         self.metric_font = ctk.CTkFont(family="DejaVu Sans", size=28, weight="bold")
 
         self.status_var = tk.StringVar(value="Locked. Enter the vault password to begin.")
@@ -1132,7 +1132,7 @@ class HumoidStudioApp(AppBase):
             width=280,
             height=16,
             mode="indeterminate",
-            fg_color="#efd8c8",
+            fg_color="#17261c",
             progress_color=PALETTE["accent_orange"],
         )
         self.progress_bar.pack(anchor="e", pady=(6, 12))
@@ -1156,9 +1156,9 @@ class HumoidStudioApp(AppBase):
             border_color=PALETTE["line"],
             segmented_button_fg_color=PALETTE["panel_alt"],
             segmented_button_selected_color=PALETTE["accent_orange"],
-            segmented_button_selected_hover_color="#f46445",
-            segmented_button_unselected_color="#f6e4d2",
-            segmented_button_unselected_hover_color="#f0dac2",
+            segmented_button_selected_hover_color="#22d868",
+            segmented_button_unselected_color="#18231b",
+            segmented_button_unselected_hover_color="#223128",
             text_color=PALETTE["text"],
             anchor="n",
         )
@@ -1194,11 +1194,13 @@ class HumoidStudioApp(AppBase):
         height = max(1, self.winfo_height())
         self.background.delete("all")
         self.background.create_rectangle(0, 0, width, height, fill=PALETTE["canvas"], outline="")
-        self.background.create_oval(-120, -80, width * 0.42, height * 0.48, fill="#ffd7c2", outline="")
-        self.background.create_oval(width * 0.48, -130, width + 160, height * 0.44, fill="#d6f6ea", outline="")
-        self.background.create_oval(width * 0.18, height * 0.42, width * 0.88, height + 140, fill="#ffe9b8", outline="")
-        self.background.create_oval(width * 0.62, height * 0.34, width + 120, height + 90, fill="#d9efff", outline="")
-        self.background.create_oval(-60, height * 0.54, width * 0.36, height + 120, fill="#ffe2f3", outline="")
+        self.background.create_oval(-140, -120, width * 0.38, height * 0.42, fill="#0d2514", outline="")
+        self.background.create_oval(width * 0.50, -110, width + 140, height * 0.36, fill="#12301c", outline="")
+        self.background.create_oval(width * 0.16, height * 0.42, width * 0.88, height + 160, fill="#0a1a10", outline="")
+        self.background.create_oval(width * 0.66, height * 0.30, width + 120, height + 90, fill="#143825", outline="")
+        self.background.create_oval(-90, height * 0.58, width * 0.34, height + 120, fill="#0f2216", outline="")
+        for y in range(0, height, 34):
+            self.background.create_line(0, y, width, y, fill="#0d1d13")
 
     def make_chip(self, parent: Any, variable: tk.StringVar, color: str) -> ctk.CTkLabel:
         return ctk.CTkLabel(
@@ -1232,9 +1234,9 @@ class HumoidStudioApp(AppBase):
             corner_radius=18,
             fg_color=fg_color,
             hover_color=hover_color,
-            text_color="#fffdf8",
+            text_color="#041308",
             border_width=1,
-            border_color="#ffffff",
+            border_color="#7cf7aa",
             font=ctk.CTkFont(family="DejaVu Sans", size=13, weight="bold"),
         )
         return button
@@ -1853,7 +1855,7 @@ class HumoidStudioApp(AppBase):
             variable=self.settings_entropy_var,
             progress_color=PALETTE["accent_teal"],
             button_color=PALETTE["accent_teal"],
-            button_hover_color="#008c69",
+            button_hover_color="#00b85c",
             text_color=PALETTE["text"],
             font=self.body_font,
         )
@@ -1866,7 +1868,7 @@ class HumoidStudioApp(AppBase):
             variable=self.settings_delete_plaintext_var,
             progress_color=PALETTE["accent_blue"],
             button_color=PALETTE["accent_blue"],
-            button_hover_color="#0b79bf",
+            button_hover_color="#12af63",
             text_color=PALETTE["text"],
             font=self.body_font,
         )
@@ -1889,7 +1891,7 @@ class HumoidStudioApp(AppBase):
             variable=self.settings_memory_turns_var,
             progress_color=PALETTE["accent_pink"],
             button_color=PALETTE["accent_pink"],
-            button_hover_color="#cf4d9b",
+            button_hover_color="#48d87d",
         )
         memory_slider.pack(fill="x", padx=20, pady=(0, 12))
         self.register_action(memory_slider)

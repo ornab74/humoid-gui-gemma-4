@@ -4,13 +4,16 @@ import hashlib
 import hmac
 import json
 import math
+import multiprocessing as mp
 import os
+import queue
 import random
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -770,6 +773,22 @@ def storage_summary(key: Optional[bytes]) -> Dict[str, str]:
     }
 
 
+PROCESS_TASKS = {
+    "chat_request": run_chat_request,
+    "road_scan": run_road_scan,
+}
+
+
+def process_task_runner(result_queue: Any, task_name: str, task_args: Tuple[Any, ...]) -> None:
+    try:
+        task_fn = PROCESS_TASKS[task_name]
+        result = task_fn(*task_args)
+    except Exception as exc:
+        result_queue.put(("error", f"{exc}\n\n{traceback.format_exc()}"))
+    else:
+        result_queue.put(("success", result))
+
+
 class StartupPasswordDialog(DialogBase):
     def __init__(self, app: "HumoidStudioApp"):
         if not GUI_READY:
@@ -995,13 +1014,11 @@ class HumoidStudioApp(AppBase):
         self.key: Optional[bytes] = None
         self.key_mode = "locked"
         self.busy = False
-        self.task_queue: "queue.Queue[Tuple[str, Any]]"
-        import queue
-
-        self.task_queue = queue.Queue()
+        self.task_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.chat_memory: List[Tuple[str, str]] = []
         self.last_scan_result: Optional[Dict[str, str]] = None
         self.history_offset = 0
+        self.active_process: Optional[mp.Process] = None
 
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
@@ -1284,6 +1301,56 @@ class HumoidStudioApp(AppBase):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def run_process_task(
+        self,
+        label: str,
+        task_name: str,
+        task_args: Tuple[Any, ...],
+        *,
+        on_success: Optional[Callable[[Any], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ) -> None:
+        if self.busy:
+            if messagebox:
+                messagebox.showinfo("One task at a time", "A background job is already running.")
+            return
+
+        self.set_busy(True, label)
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.Queue()
+        process = ctx.Process(target=process_task_runner, args=(result_queue, task_name, task_args), daemon=True)
+        process.start()
+        self.active_process = process
+
+        def watcher() -> None:
+            try:
+                while True:
+                    try:
+                        kind, payload = result_queue.get(timeout=0.2)
+                        break
+                    except queue.Empty:
+                        if not process.is_alive():
+                            exit_code = process.exitcode
+                            self.task_queue.put(
+                                (
+                                    "error",
+                                    RuntimeError(f"Background process exited unexpectedly with code {exit_code}."),
+                                    on_error,
+                                )
+                            )
+                            return
+            finally:
+                process.join(timeout=0.5)
+                result_queue.close()
+                self.active_process = None
+
+            if kind == "success":
+                self.task_queue.put(("success", payload, on_success))
+            else:
+                self.task_queue.put(("error", RuntimeError(str(payload)), on_error))
+
+        threading.Thread(target=watcher, daemon=True).start()
+
     def process_task_queue(self) -> None:
         try:
             while True:
@@ -1467,6 +1534,8 @@ class HumoidStudioApp(AppBase):
         )
         self.chat_input.grid(row=0, column=0, sticky="ew")
         self.register_action(self.chat_input)
+        self.chat_input.bind("<Return>", self.handle_chat_return)
+        self.chat_input.bind("<Shift-Return>", self.handle_chat_shift_return)
 
         actions = ctk.CTkFrame(compose, fg_color="transparent")
         actions.grid(row=0, column=1, sticky="ns", padx=(14, 0))
@@ -1947,6 +2016,13 @@ class HumoidStudioApp(AppBase):
         self.chat_output.configure(state="disabled")
         self.refresh_memory_preview()
 
+    def handle_chat_return(self, _event: Any) -> str:
+        self.submit_chat()
+        return "break"
+
+    def handle_chat_shift_return(self, _event: Any) -> Optional[str]:
+        return None
+
     def submit_chat(self) -> None:
         if not self.ensure_unlocked():
             return
@@ -1966,9 +2042,10 @@ class HumoidStudioApp(AppBase):
             self.refresh_memory_preview()
             self.status_var.set("Reply ready. The model vault has been sealed again.")
 
-        self.run_task(
+        self.run_process_task(
             "Generating a local reply...",
-            lambda reporter: run_chat_request(self.key, prompt, memory_snapshot, memory_turns),
+            "chat_request",
+            (self.key, prompt, memory_snapshot, memory_turns),
             on_success=on_success,
         )
 
@@ -2075,9 +2152,10 @@ class HumoidStudioApp(AppBase):
             self.road_export_button.configure(state="normal")
             self.status_var.set("Road scan complete. The result has been logged into the encrypted history vault.")
 
-        self.run_task(
+        self.run_process_task(
             "Running the road scanner locally...",
-            lambda reporter: run_road_scan(self.key, data, include_entropy),
+            "road_scan",
+            (self.key, data, include_entropy),
             on_success=on_success,
         )
 

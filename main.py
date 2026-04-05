@@ -541,12 +541,12 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
     system_text = "You are a precise road risk classifier. Return only one word: Low, Medium, or High."
     user_text = (
         "Analyze the driving scene and return exactly one word: Low, Medium, or High.\n\n"
-        f"Location: {data.get('location', 'unspecified location')}\n"
-        f"Road type: {data.get('road_type', 'unknown')}\n"
-        f"Weather: {data.get('weather', 'unknown')}\n"
-        f"Traffic: {data.get('traffic', 'unknown')}\n"
-        f"Obstacles: {data.get('obstacles', 'none')}\n"
-        f"Sensor notes: {data.get('sensor_notes', 'none')}\n"
+        f"Location: {data.get('location', '')}\n"
+        f"Road type: {data.get('road_type', '')}\n"
+        f"Weather: {data.get('weather', '')}\n"
+        f"Traffic: {data.get('traffic', '')}\n"
+        f"Obstacles: {data.get('obstacles', '')}\n"
+        f"Sensor notes: {data.get('sensor_notes', '')}\n"
         f"{metrics_line}\n"
         f"Quantum State: {entropy_text}\n\n"
         "Rules:\n"
@@ -801,8 +801,9 @@ class StartupPasswordDialog(DialogBase):
         self.error_var = tk.StringVar(value="")
 
         self.title("Unlock Humoid Studio")
-        self.geometry("520x420")
-        self.minsize(520, 420)
+        self.geometry("560x520")
+        self.minsize(560, 520)
+        self.resizable(False, False)
         self.configure(fg_color=PALETTE["panel"])
         self.transient(app)
         self.grab_set()
@@ -848,6 +849,14 @@ class StartupPasswordDialog(DialogBase):
         )
         self.banner.pack(fill="x", padx=28, pady=(0, 18))
 
+        password_label_text = "Create vault password" if self.mode in ("missing", "legacy_raw") else "Vault password"
+        ctk.CTkLabel(
+            frame,
+            text=password_label_text,
+            font=app.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(anchor="w", padx=28, pady=(0, 6))
+
         self.password_entry = ctk.CTkEntry(
             frame,
             textvariable=self.password_var,
@@ -862,6 +871,14 @@ class StartupPasswordDialog(DialogBase):
         )
         self.password_entry.pack(fill="x", padx=28)
 
+        if self.mode in ("missing", "legacy_raw"):
+            ctk.CTkLabel(
+                frame,
+                text="Confirm password",
+                font=app.small_font,
+                text_color=PALETTE["muted"],
+            ).pack(anchor="w", padx=28, pady=(14, 6))
+
         self.confirm_entry = ctk.CTkEntry(
             frame,
             textvariable=self.confirm_var,
@@ -875,7 +892,7 @@ class StartupPasswordDialog(DialogBase):
             font=app.body_font,
         )
         if self.mode in ("missing", "legacy_raw"):
-            self.confirm_entry.pack(fill="x", padx=28, pady=(14, 0))
+            self.confirm_entry.pack(fill="x", padx=28)
 
         ctk.CTkLabel(
             frame,
@@ -887,7 +904,7 @@ class StartupPasswordDialog(DialogBase):
         ).pack(anchor="w", padx=28, pady=(14, 0))
 
         footer = ctk.CTkFrame(frame, fg_color="transparent")
-        footer.pack(fill="x", side="bottom", padx=28, pady=28)
+        footer.pack(fill="x", padx=28, pady=(24, 28))
 
         if self.mode == "legacy_raw":
             legacy_button = app.make_button(
@@ -2118,17 +2135,8 @@ class HumoidStudioApp(AppBase):
 
     def collect_road_form(self) -> Dict[str, str]:
         data: Dict[str, str] = {}
-        defaults = {
-            "location": "unspecified location",
-            "road_type": "highway",
-            "weather": "clear",
-            "traffic": "medium",
-            "obstacles": "none",
-            "sensor_notes": "none",
-        }
         for key, widget in self.road_inputs.items():
-            value = widget.get().strip()
-            data[key] = value or defaults[key]
+            data[key] = widget.get().strip()
         return data
 
     def run_road_scan_action(self) -> None:

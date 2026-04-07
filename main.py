@@ -2926,6 +2926,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         left.grid_rowconfigure(0, weight=1)
         left.grid_rowconfigure(1, weight=0)
         left.grid_rowconfigure(2, weight=0)
+        left.grid_rowconfigure(3, weight=0)
         left.grid_columnconfigure(0, weight=1)
 
         self.chat_output = ctk.CTkTextbox(
@@ -2975,8 +2976,32 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             text_color=PALETTE["muted"],
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+        self.chat_toolbar_visible = True
+        compact_toolbar = ctk.CTkFrame(left, fg_color="transparent")
+        compact_toolbar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        compact_toolbar.grid_columnconfigure(0, weight=1)
+
+        compact_buttons = ctk.CTkFrame(compact_toolbar, fg_color="transparent")
+        compact_buttons.grid(row=0, column=0, sticky="e")
+
+        new_session_button = self.make_button(compact_buttons, "New", self.new_session, 0, width=84, height=34)
+        new_session_button.pack(side="left", padx=(0, 8))
+        self.register_action(new_session_button)
+
+        self.chat_toolbar_toggle_button = self.make_button(
+            compact_buttons,
+            "Hide Tools",
+            self.toggle_chat_toolbar,
+            4,
+            width=104,
+            height=34,
+        )
+        self.chat_toolbar_toggle_button.pack(side="left")
+        self.register_action(self.chat_toolbar_toggle_button, allow_during_busy=True)
+
         toolbar = ctk.CTkFrame(left, fg_color=PALETTE["card_soft"], corner_radius=18, border_width=1, border_color=PALETTE["line"])
-        toolbar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self.chat_toolbar = toolbar
+        toolbar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
         for column_index in (0, 1, 2):
             toolbar.grid_columnconfigure(column_index, weight=1)
 
@@ -2989,11 +3014,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             text_color=PALETTE["muted"],
         ).pack(side="left", padx=(0, 8))
 
-        new_session_button = self.make_button(session_group, "New", self.new_session, 0, width=86, height=36)
-        new_session_button.pack(side="left", padx=(0, 8))
-        self.register_action(new_session_button)
-
-        clear_button = self.make_button(session_group, "Clear", self.clear_chat, 3, width=88, height=36)
+        clear_button = self.make_button(session_group, "Clear Chat", self.clear_chat, 3, width=112, height=36)
         clear_button.pack(side="left")
         self.register_action(clear_button)
 
@@ -3147,6 +3168,32 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         hide_memory_button = self.make_button(right, "Hide Memory", self.hide_memory_panel, 5, width=140, height=38)
         hide_memory_button.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 20))
         self.register_action(hide_memory_button)
+
+    def toggle_chat_toolbar(self) -> None:
+        if getattr(self, "chat_toolbar_visible", True):
+            self.hide_chat_toolbar()
+        else:
+            self.show_chat_toolbar()
+
+    def show_chat_toolbar(self) -> None:
+        if not hasattr(self, "chat_toolbar"):
+            return
+        self.chat_toolbar_visible = True
+        self.chat_toolbar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        try:
+            self.chat_toolbar_toggle_button.configure(text="Hide Tools")
+        except Exception:
+            pass
+
+    def hide_chat_toolbar(self) -> None:
+        if not hasattr(self, "chat_toolbar"):
+            return
+        self.chat_toolbar_visible = False
+        self.chat_toolbar.grid_remove()
+        try:
+            self.chat_toolbar_toggle_button.configure(text="Show Tools")
+        except Exception:
+            pass
 
     def toggle_memory_panel(self) -> None:
         if getattr(self, "memory_panel_visible", False):

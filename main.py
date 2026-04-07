@@ -1445,17 +1445,31 @@ def storage_summary(key: Optional[bytes]) -> Dict[str, str]:
 
     if key is None:
         history_count = "Locked"
+        conversation_count = "Locked"
     else:
         try:
-            history_count = str(count_history_rows(key))
+            with unlocked_db_path(key) as temp_db:
+                with sqlite3.connect(temp_db) as db:
+                    history_count = str(int(db.execute("SELECT COUNT(*) FROM history").fetchone()[0]))
+                    conversation_count = str(
+                        int(
+                            db.execute(
+                                "SELECT COUNT(*) "
+                                "FROM sessions s "
+                                "WHERE EXISTS (SELECT 1 FROM history h WHERE h.session_id = s.id)"
+                            ).fetchone()[0]
+                        )
+                    )
         except Exception:
             history_count = "Unavailable"
+            conversation_count = "Unavailable"
 
     return {
         "model_state": model_state,
         "encrypted_size": encrypted_size,
         "plaintext_size": plaintext_size,
         "history_count": history_count,
+        "conversation_count": conversation_count,
         "key_mode": detect_key_mode(),
     }
 
@@ -1811,7 +1825,7 @@ class HumoidStudioApp(AppBase):
         self.hash_status_var = tk.StringVar(value="Hash: Not checked")
         self.dashboard_vault_var = tk.StringVar(value="Locked")
         self.dashboard_history_var = tk.StringVar(value="Locked")
-        self.dashboard_plaintext_var = tk.StringVar(value="0B")
+        self.dashboard_chats_var = tk.StringVar(value="Locked")
         self.dashboard_clock_var = tk.StringVar(value=time.strftime("%A, %B %d, %Y\n%I:%M:%S %p"))
         self.ai_mood_var = tk.StringVar(value="Unlock the vault to generate a local QID mood from recent tabs.")
         self.ai_color_var = tk.StringVar(value="#39ff88")
@@ -2422,7 +2436,7 @@ class HumoidStudioApp(AppBase):
         cards = [
             ("Vault State", self.dashboard_vault_var, PALETTE["accent_orange"]),
             ("History Entries", self.dashboard_history_var, PALETTE["accent_teal"]),
-            ("Plaintext Copy", self.dashboard_plaintext_var, PALETTE["accent_blue"]),
+            ("Saved Chats", self.dashboard_chats_var, PALETTE["accent_blue"]),
         ]
         for idx, (title, variable, accent) in enumerate(cards):
             card = ctk.CTkFrame(
@@ -4200,7 +4214,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.model_status_var.set(f"Model: {summary['model_state']}")
         self.dashboard_vault_var.set(summary["encrypted_size"])
         self.dashboard_history_var.set(summary["history_count"])
-        self.dashboard_plaintext_var.set(summary["plaintext_size"])
+        self.dashboard_chats_var.set(summary["conversation_count"])
         if self.key is not None:
             try:
                 self.render_recent_session_tabs(fetch_recent_sessions(self.key))

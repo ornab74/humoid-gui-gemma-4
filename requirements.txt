@@ -37,6 +37,10 @@ autoray==0.8.10 \
     --hash=sha256:033f4ba37e2278ece9c50be4a42abe0d91d5c611194d90904c4e6d980300454a \
     --hash=sha256:a411c87fe5c0c12120c56478ddf64172d584705e582ef86ef12f81f5769f697f
     # via pennylane
+bleach==6.3.0 \
+    --hash=sha256:6f3b91b1c0a02bb9a78b5a454c92506aa0fdf197e1d5e114d2e00c6f64306d22 \
+    --hash=sha256:fe10ec77c93ddf3d13a73b035abaac7a9f5e436513864ccdad516693213c65d6
+    # via -r requirements.in
 cachetools==7.0.5 \
     --hash=sha256:0cd042c24377200c1dcd225f8b7b12b0ca53cc2c961b43757e774ebe190fd990 \
     --hash=sha256:46bc8ebefbe485407621d0a4264b23c080cedd913921bad7ac3ed2f26c183114
@@ -327,6 +331,14 @@ cryptography==46.0.1 \
     --hash=sha256:f9b55038b5c6c47559aa33626d8ecd092f354e23de3c6975e4bb205df128a2a0 \
     --hash=sha256:fd4b5e2ee4e60425711ec65c33add4e7a626adef79d66f62ba0acfd493af282d
     # via -r requirements.in
+customtkinter==5.2.2 \
+    --hash=sha256:14ad3e7cd3cb3b9eb642b9d4e8711ae80d3f79fb82545ad11258eeffb2e6b37c \
+    --hash=sha256:fd8db3bafa961c982ee6030dba80b4c2e25858630756b513986db19113d8d207
+    # via -r requirements.in
+darkdetect==0.8.0 \
+    --hash=sha256:a7509ccf517eaad92b31c214f593dbcf138ea8a43b2935406bbd565e15527a85 \
+    --hash=sha256:b5428e1170263eb5dea44c25dc3895edd75e6f52300986353cd63533fe7df8b1
+    # via customtkinter
 diastatic-malt==2.15.3 \
     --hash=sha256:bc99f842a35e4f2594488ac231b8594011e4e11eea0fc661a98a554dff60d1c3 \
     --hash=sha256:f41aeff992bd07553b85a5947700452f551d419d439ab34464bca4f30dc2a6a1
@@ -505,6 +517,7 @@ packaging==26.0 \
     --hash=sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4 \
     --hash=sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529
     # via
+    #   customtkinter
     #   huggingface-hub
     #   pennylane
 pennylane==0.41.0 \
@@ -562,6 +575,10 @@ pygments==2.20.0 \
     --hash=sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f \
     --hash=sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176
     # via rich
+pyttsx3==2.99 \
+    --hash=sha256:a18a5601530a570c43491b4112887fc34c47e118fc937287db8d21905da1f74e \
+    --hash=sha256:ff3e4ff756c24d72b9f3f2f304e0edaafd0f58adb0e6f4b90d930440cda8b207
+    # via -r requirements.in
 pyyaml==6.0.3 \
     --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
     --hash=sha256:0150219816b6a1fa26fb4699fb7daa9caf09eb1999f3b70fb6e786805e80375a \
@@ -773,3 +790,7 @@ wcwidth==0.6.0 \
     --hash=sha256:1a3a1e510b553315f8e146c54764f4fb6264ffad731b3d78088cdb1478ffbdad \
     --hash=sha256:cdc4e4262d6ef9a1a57e018384cbeb1208d8abbc64176027e2c2455c81313159
     # via prompt-toolkit
+webencodings==0.5.1 \
+    --hash=sha256:a0af1213f3c2226497a97e2b3aa01a7e4bee4f403f95be16fc9acd2947514a78 \
+    --hash=sha256:b36a1c245f2d304965eb4e0a82848379241dc04b865afcc4aab16748587e1923
+    # via bleach

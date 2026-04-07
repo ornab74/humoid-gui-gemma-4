@@ -1140,6 +1140,36 @@ def run_session_title_request(key: bytes, prompt: str, reply: str) -> str:
     return title or "Local AI conversation"
 
 
+def run_qid_mood_request(key: bytes, qid: str, color: str, sessions: List[Dict[str, Any]]) -> str:
+    session_lines = []
+    for session in sessions[:6]:
+        session_lines.append(
+            "- {title} | updated={updated_at} | turns={turns}".format(
+                title=sanitize_text(session.get("title", "Untitled session"), max_chars=90),
+                updated_at=sanitize_text(session.get("updated_at", ""), max_chars=40),
+                turns=int(session.get("turns", 0)),
+            )
+        )
+    prompt = (
+        "Name this local dashboard quantum identity mood. Return one short line only, no markdown.\n\n"
+        f"QID: {sanitize_text(qid, max_chars=32)}\n"
+        f"Color: {sanitize_text(color, max_chars=16)}\n"
+        "Recent conversation tabs:\n"
+        + ("\n".join(session_lines) if session_lines else "- No recent sessions yet")
+        + "\n\nMake it feel matrix/cyber, but keep it readable and under 90 characters."
+    )
+    with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
+        raw_mood = litert_chat_blocking(
+            model_path,
+            prompt,
+            system_text="You create short tasteful UI mood labels. Return one line only.",
+            cache_dir=cache_dir,
+        )
+    mood = sanitize_text(raw_mood, max_chars=140).strip().replace("\n", " ")
+    mood = re.sub(r"\s+", " ", mood).strip().strip('"').strip("'")
+    return mood or f"QID-{sanitize_text(qid, max_chars=16)} online"
+
+
 def qid_quantum_identity_from_sessions(sessions: List[Dict[str, Any]]) -> Dict[str, str]:
     payload = json.dumps(
         [
@@ -1158,6 +1188,7 @@ def qid_quantum_identity_from_sessions(sessions: List[Dict[str, Any]]) -> Dict[s
     angles = [digest[index] / 255.0 for index in range(6)]
 
     rgb: Tuple[int, int, int]
+    backend = "SHA fallback"
     if qml is not None:
         try:
             device = qml.device("default.qubit", wires=3)
@@ -1176,6 +1207,7 @@ def qid_quantum_identity_from_sessions(sessions: List[Dict[str, Any]]) -> Dict[s
 
             expvals = qid_circuit(*angles)
             rgb = tuple(max(50, min(255, int(((float(value) + 1.0) / 2.0) * 255))) for value in expvals)  # type: ignore[assignment]
+            backend = "PennyLane circuit"
         except Exception:
             rgb = (digest[6], digest[7], digest[8])
     else:
@@ -1188,7 +1220,13 @@ def qid_quantum_identity_from_sessions(sessions: List[Dict[str, Any]]) -> Dict[s
     b = max(40, min(b, 180))
     color = f"#{r:02x}{g:02x}{b:02x}"
     mood = f"QID-{qid} | {len(sessions[:6])} recent tab{'s' if len(sessions[:6]) != 1 else ''} entangled into local color state."
-    return {"qid": qid, "color": color, "mood": mood}
+    return {
+        "qid": qid,
+        "color": color,
+        "mood": mood,
+        "rgb": f"rgb({r}, {g}, {b})",
+        "backend": backend,
+    }
 
 
 def run_road_scan(key: bytes, data: Dict[str, str], include_system_entropy: bool) -> Dict[str, str]:
@@ -1375,6 +1413,7 @@ def describe_process_exit(task_name: str, task_args: Tuple[Any, ...], exit_code:
 PROCESS_TASKS = {
     "chat_request": run_chat_request,
     "session_title": run_session_title_request,
+    "qid_mood": run_qid_mood_request,
     "road_scan": run_road_scan,
 }
 
@@ -1678,6 +1717,9 @@ class HumoidStudioApp(AppBase):
         self.ai_color_var = tk.StringVar(value="#39ff88")
         self.recent_sessions_var = tk.StringVar(value="Unlock the vault to load recent conversations.")
         self.dashboard_recent_tabs: List[str] = []
+        self.current_qid_info: Dict[str, str] = {}
+        self.current_qid_sessions: List[Dict[str, Any]] = []
+        self.qid_mood_requested_signature = ""
         self.history_search_var = tk.StringVar()
         self.history_status_var = tk.StringVar(value="Unlock the vault to search history.")
         self.settings_entropy_var = tk.BooleanVar(value=bool(self.settings_data.get("include_system_entropy", True)))
@@ -1926,6 +1968,7 @@ class HumoidStudioApp(AppBase):
         except Exception as exc:
             self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}")
         self.refresh_dashboard()
+        self.after(700, self.request_qid_mood_generation)
         self.after(150, self.refresh_history_action)
 
     def ensure_unlocked(self) -> bool:
@@ -1936,16 +1979,87 @@ class HumoidStudioApp(AppBase):
             messagebox.showinfo("Vault Locked", "Unlock the studio before running model or history actions.")
         return False
 
+    def reset_qid_display(self) -> None:
+        self.current_qid_info = {}
+        self.current_qid_sessions = []
+        self.qid_mood_requested_signature = ""
+        self.ai_color_var.set("#39ff88")
+        self.ai_mood_var.set("Unlock the vault to generate a local QID mood from recent tabs.")
+        try:
+            if hasattr(self, "ai_color_swatch"):
+                self.ai_color_swatch.configure(fg_color="#39ff88", text="#39ff88\nlocked", text_color="#031009")
+            if hasattr(self, "ai_color_chip"):
+                self.ai_color_chip.configure(
+                    fg_color=PALETTE["panel_alt"],
+                    text="QID waiting for vault unlock",
+                    text_color=PALETTE["accent_gold"],
+                )
+        except Exception:
+            pass
+
     def update_ai_qid_mood(self, sessions: List[Dict[str, Any]]) -> None:
         qid = qid_quantum_identity_from_sessions(sessions)
         color = qid["color"]
+        self.current_qid_info = dict(qid)
+        self.current_qid_sessions = [dict(session) for session in sessions[:6]]
         self.ai_color_var.set(color)
         self.ai_mood_var.set(qid["mood"])
         try:
             text_color = "#031009" if self.color_luminance(color) > 120 else "#effff2"
-            self.ai_color_chip.configure(fg_color=color, text=f"AI QID Color {color}", text_color=text_color)
+            if hasattr(self, "ai_color_swatch"):
+                self.ai_color_swatch.configure(
+                    fg_color=color,
+                    text=f"{color}\n{qid.get('rgb', '')}",
+                    text_color=text_color,
+                )
+            self.ai_color_chip.configure(
+                fg_color=PALETTE["panel_alt"],
+                text=f"{qid.get('backend', 'QID')} | {qid['qid']}",
+                text_color=PALETTE["accent_gold"],
+            )
         except Exception:
             pass
+
+    def request_qid_mood_generation(self, force: bool = False) -> None:
+        if self.key is None:
+            return
+        qid = self.current_qid_info.get("qid", "")
+        color = self.current_qid_info.get("color", self.ai_color_var.get())
+        if not qid:
+            self.refresh_dashboard()
+            qid = self.current_qid_info.get("qid", "")
+            color = self.current_qid_info.get("color", color)
+        if not qid:
+            return
+        if not force and self.qid_mood_requested_signature == qid:
+            return
+        if self.busy:
+            self.after(900, lambda: self.request_qid_mood_generation(force=force))
+            return
+        self.qid_mood_requested_signature = qid
+        if not ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
+            self.ai_mood_var.set(f"{self.current_qid_info.get('mood', 'QID ready')} Local model unavailable for mood naming.")
+            return
+
+        sessions_snapshot = [dict(session) for session in self.current_qid_sessions]
+        base_mood = self.current_qid_info.get("mood", f"QID-{qid}")
+        self.ai_mood_var.set(f"{base_mood}\nAsking Gemma to name this identity...")
+
+        def on_success(mood: str) -> None:
+            clean_mood = sanitize_text(mood, max_chars=160).strip()
+            self.ai_mood_var.set(f"{clean_mood}\nQID-{qid} | {color}")
+            self.status_var.set("QID mood named by local Gemma.")
+
+        def on_error(exc: Exception) -> None:
+            self.ai_mood_var.set(f"{base_mood}\nGemma mood naming unavailable: {sanitize_text(exc, max_chars=90)}")
+
+        self.run_process_task(
+            "Naming the QID mood with local Gemma...",
+            "qid_mood",
+            (self.key, qid, color, sessions_snapshot),
+            on_success=on_success,
+            on_error=on_error,
+        )
 
     def color_luminance(self, color: str) -> float:
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
@@ -2141,12 +2255,26 @@ class HumoidStudioApp(AppBase):
             justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 18))
 
-        self.ai_color_chip = ctk.CTkLabel(
+        self.ai_color_swatch = ctk.CTkLabel(
             signal_card,
-            text="AI QID Color",
-            font=self.small_font,
+            text=self.ai_color_var.get(),
+            font=ctk.CTkFont(family="DejaVu Sans Mono", size=26, weight="bold"),
             text_color="#031009",
             fg_color=self.ai_color_var.get(),
+            corner_radius=22,
+            width=300,
+            height=86,
+            padx=18,
+            pady=16,
+        )
+        self.ai_color_swatch.pack(anchor="w", fill="x", padx=20, pady=(0, 10))
+
+        self.ai_color_chip = ctk.CTkLabel(
+            signal_card,
+            text="QID waiting for vault unlock",
+            font=self.small_font,
+            text_color=PALETTE["accent_gold"],
+            fg_color=PALETTE["panel_alt"],
             corner_radius=16,
             padx=14,
             pady=8,
@@ -2160,7 +2288,20 @@ class HumoidStudioApp(AppBase):
             text_color=PALETTE["muted"],
             justify="left",
             wraplength=340,
-        ).pack(anchor="w", fill="x", padx=20, pady=(0, 20))
+        ).pack(anchor="w", fill="x", padx=20, pady=(0, 12))
+
+        qid_buttons = ctk.CTkFrame(signal_card, fg_color="transparent")
+        qid_buttons.pack(anchor="w", padx=20, pady=(0, 20))
+        generate_qid_button = self.make_button(
+            qid_buttons,
+            "Generate Mood",
+            lambda: self.request_qid_mood_generation(force=True),
+            2,
+            width=150,
+            height=38,
+        )
+        generate_qid_button.pack(side="left")
+        self.register_action(generate_qid_button)
 
         recents_card = ctk.CTkFrame(
             lower,
@@ -2173,12 +2314,25 @@ class HumoidStudioApp(AppBase):
         recents_card.grid_columnconfigure(0, weight=1)
         recents_card.grid_rowconfigure(1, weight=1)
 
+        recents_header = ctk.CTkFrame(recents_card, fg_color="transparent")
+        recents_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 8))
+        recents_header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            recents_card,
+            recents_header,
             text="Recent Conversations",
             font=self.section_font,
             text_color=PALETTE["text"],
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 8))
+        ).grid(row=0, column=0, sticky="w")
+        new_session_dash_button = self.make_button(
+            recents_header,
+            "New Session",
+            self.new_session,
+            0,
+            width=140,
+            height=38,
+        )
+        new_session_dash_button.grid(row=0, column=1, sticky="e")
+        self.register_action(new_session_dash_button)
 
         self.recent_sessions_tabview = ctk.CTkTabview(
             recents_card,
@@ -2208,7 +2362,12 @@ class HumoidStudioApp(AppBase):
         self.dashboard_recent_tabs = []
 
         if not sessions:
-            self.update_ai_qid_mood([])
+            if self.key is None:
+                self.reset_qid_display()
+            else:
+                self.update_ai_qid_mood([])
+                if self.qid_mood_requested_signature != self.current_qid_info.get("qid", ""):
+                    self.after(350, self.request_qid_mood_generation)
             tab_name = "No Sessions"
             tab = self.recent_sessions_tabview.add(tab_name)
             self.dashboard_recent_tabs.append(tab_name)
@@ -2223,6 +2382,8 @@ class HumoidStudioApp(AppBase):
             return
 
         self.update_ai_qid_mood(sessions)
+        if self.key is not None and self.qid_mood_requested_signature != self.current_qid_info.get("qid", ""):
+            self.after(350, self.request_qid_mood_generation)
         for idx, session in enumerate(sessions, start=1):
             title = sanitize_text(session.get("title", "Untitled session"), max_chars=44).replace("\n", " ").strip()
             tab_name = f"{idx}. {title[:24]}" if title else f"{idx}. Session"
@@ -2545,6 +2706,10 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         send_button = self.make_button(actions, "Send Prompt", self.submit_chat, 1, width=150, height=46)
         send_button.pack(pady=(0, 10))
         self.register_action(send_button)
+
+        new_session_button = self.make_button(actions, "New Session", self.new_session, 0, width=150, height=42)
+        new_session_button.pack(pady=(0, 10))
+        self.register_action(new_session_button)
 
         clear_button = self.make_button(actions, "Clear Chat", self.clear_chat, 3, width=150, height=42)
         clear_button.pack()
@@ -3393,6 +3558,21 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.model_status_box.insert("1.0", "\n".join(lines))
         self.model_status_box.configure(state="disabled")
 
+    def new_session(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        self.clear_chat()
+        self.clear_prompt_image()
+        self.tabview.set("Chat")
+        self.chat_output.configure(state="normal")
+        self.chat_output.insert(
+            "end",
+            "New session ready. Your previous conversations stay sealed in encrypted history.\n\n",
+            ("meta",),
+        )
+        self.chat_output.configure(state="disabled")
+        self.status_var.set("New chat session ready. The next message will create a fresh encrypted session.")
+
     def clear_chat(self) -> None:
         self.chat_memory.clear()
         self.current_session_id = None
@@ -3650,6 +3830,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.hash_status_var.set(f"Hash: Verified {sha[:12]}...")
             self.status_var.set("Model download finished and the encrypted vault is ready.")
             self.refresh_dashboard()
+            self.qid_mood_requested_signature = ""
+            self.after(500, lambda: self.request_qid_mood_generation(force=True))
 
         self.run_task(
             "Downloading and sealing the model vault...",
@@ -3990,13 +4172,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.hash_status_var.set("Hash: Not checked")
         self.chat_memory.clear()
         self.refresh_memory_preview()
-        self.ai_mood_var.set("Unlock the vault to generate a local QID mood from recent tabs.")
-        self.ai_color_var.set("#39ff88")
-        try:
-            self.ai_color_chip.configure(fg_color="#39ff88", text="AI QID Color #39ff88", text_color="#031009")
-        except Exception:
-            pass
         self.render_recent_session_tabs([])
+        self.reset_qid_display()
         self.set_action_state(False)
         self.open_startup_dialog()
 

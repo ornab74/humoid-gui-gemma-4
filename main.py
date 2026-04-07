@@ -8,7 +8,11 @@ import multiprocessing as mp
 import os
 import queue
 import random
+import re
+import shutil
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -23,6 +27,16 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+try:
+    import bleach
+    BLEACH_IMPORT_ERROR = None
+except Exception as exc:
+    bleach = None
+    BLEACH_IMPORT_ERROR = exc
+
+pyttsx3 = None
+PYTTSX3_IMPORT_ERROR = None
 
 try:
     import tkinter as tk
@@ -41,10 +55,8 @@ except Exception as exc:
     ctk = None
     CTK_IMPORT_ERROR = exc
 
-try:
-    import litert_lm
-except Exception:
-    litert_lm = None
+litert_lm = None
+LITERT_IMPORT_ERROR = None
 
 try:
     import psutil
@@ -73,6 +85,10 @@ KEY_PATH = Path(".enc_key")
 SETTINGS_PATH = Path("gui_settings.json")
 CACHE_DIR = Path(".litert_lm_cache")
 STREAM_MAGIC = b"HGGM2"
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,6 +126,7 @@ DEFAULT_SETTINGS = {
     "include_system_entropy": True,
     "delete_plaintext_after_encrypt": True,
     "chat_memory_turns": 6,
+    "enable_native_image_input": True,
 }
 
 GUI_READY = tk is not None and ctk is not None
@@ -124,6 +141,105 @@ def human_size(num_bytes: int) -> str:
             return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
         size /= 1024.0
     return f"{int(num_bytes)}B"
+
+
+def sanitize_text(value: Any, *, max_chars: int = 20000) -> str:
+    text = "" if value is None else str(value)
+    if bleach is not None:
+        text = bleach.clean(text, tags=[], attributes={}, protocols=[], strip=True)
+    text = CONTROL_CHARS_RE.sub("", text)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n[truncated]"
+    return text
+
+
+def render_markdown_for_display(value: Any, *, max_chars: int = 20000) -> str:
+    text = sanitize_text(value, max_chars=max_chars).replace("\r\n", "\n").replace("\r", "\n")
+    rendered: List[str] = []
+    in_code_block = False
+
+    for raw_line in text.split("\n"):
+        stripped = raw_line.strip()
+        if stripped.startswith("```"):
+            if in_code_block:
+                rendered.append("--- end code ---")
+                in_code_block = False
+            else:
+                language = stripped[3:].strip()
+                rendered.append(f"--- code {language} ---" if language else "--- code ---")
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            rendered.append("    " + raw_line)
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.+)$", raw_line)
+        if heading:
+            rendered.append(heading.group(2).strip().upper())
+            continue
+
+        line = MARKDOWN_LINK_RE.sub(r"\1 (\2)", raw_line)
+        line = re.sub(r"(\*\*|__)(.*?)\1", r"\2", line)
+        line = re.sub(r"(\*|_)(.*?)\1", r"\2", line)
+        line = re.sub(r"`([^`]+)`", r"\1", line)
+        rendered.append(line)
+
+    if in_code_block:
+        rendered.append("--- end code ---")
+    return "\n".join(rendered).strip()
+
+
+def validate_image_path(image_path: str | Path) -> Path:
+    raw_path = Path(image_path).expanduser()
+    if raw_path.is_symlink():
+        raise ValueError("Symlinked images are not allowed.")
+
+    path = raw_path.resolve(strict=True)
+    if not path.is_file():
+        raise ValueError("Selected image is not a regular file.")
+
+    extension = path.suffix.lower()
+    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTENSIONS))
+        raise ValueError(f"Unsupported image type. Allowed extensions: {allowed}.")
+
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError("Selected image is empty.")
+    if size > MAX_IMAGE_BYTES:
+        raise ValueError(f"Selected image is too large. Limit: {human_size(MAX_IMAGE_BYTES)}.")
+
+    with path.open("rb") as handle:
+        header = handle.read(16)
+    looks_like_jpeg = extension in {".jpg", ".jpeg"} and header.startswith(b"\xff\xd8\xff")
+    looks_like_png = extension == ".png" and header.startswith(b"\x89PNG\r\n\x1a\n")
+    looks_like_webp = extension == ".webp" and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+    if not (looks_like_jpeg or looks_like_png or looks_like_webp):
+        raise ValueError("Selected image bytes do not match the file extension.")
+
+    return path
+
+
+def configured_model_supports_native_image_input() -> bool:
+    model_name = MODEL_FILE.lower()
+    return any(marker in model_name for marker in ("gemma-4", "gemma-3n", "multimodal", "vision"))
+
+
+def image_metadata_prompt(image_path: Path, *, native_requested: bool, native_allowed: bool) -> str:
+    sha = sha256_file(image_path)
+    mode = "native pixels enabled" if native_requested and native_allowed else "metadata only"
+    reason = "compatible multimodal model detected" if native_allowed else "current model is not marked multimodal"
+    return (
+        "\n\n[Validated image attachment]\n"
+        f"filename: {sanitize_text(image_path.name, max_chars=160)}\n"
+        f"type: {sanitize_text(image_path.suffix.lower(), max_chars=16)}\n"
+        f"size: {human_size(image_path.stat().st_size)}\n"
+        f"sha256: {sha}\n"
+        f"image_input_mode: {mode}\n"
+        f"native_image_reason: {reason}\n"
+        "security_note: no image bytes or filesystem path are included in this metadata prompt.\n"
+    )
 
 
 def safe_cleanup(paths: List[Path]) -> None:
@@ -385,23 +501,54 @@ def count_history_rows(key: bytes) -> int:
 
 
 def require_litert_lm() -> None:
+    global litert_lm, LITERT_IMPORT_ERROR
+    if litert_lm is None and LITERT_IMPORT_ERROR is None:
+        try:
+            import litert_lm as litert_lm_module
+        except Exception as exc:
+            LITERT_IMPORT_ERROR = exc
+        else:
+            litert_lm = litert_lm_module
+
     if litert_lm is None:
+        detail = f" Import error: {LITERT_IMPORT_ERROR}" if LITERT_IMPORT_ERROR else ""
         raise RuntimeError(
             "LiteRT-LM is not installed. Install the project dependencies first so the local model runtime is available."
+            + detail
         )
 
 
-def load_litert_engine(model_path: Path):
+def load_litert_engine(model_path: Path, cache_dir: Optional[Path] = None, *, enable_vision: bool = False):
     require_litert_lm()
     try:
         litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
     except Exception:
         pass
-    return litert_lm.Engine(
-        str(model_path),
-        backend=litert_lm.Backend.CPU,
-        cache_dir=str(CACHE_DIR),
-    )
+    engine_kwargs = {
+        "backend": litert_lm.Backend.CPU,
+        "cache_dir": str(cache_dir or CACHE_DIR),
+    }
+    if enable_vision:
+        engine_kwargs["vision_backend"] = litert_lm.Backend.CPU
+    try:
+        return litert_lm.Engine(str(model_path), **engine_kwargs)
+    except TypeError as exc:
+        if enable_vision:
+            raise RuntimeError(
+                "This installed LiteRT-LM package rejected vision_backend. "
+                "Upgrade litert-lm before using native Gemma 4 image input."
+            ) from exc
+        raise
+
+
+@contextmanager
+def temporary_litert_cache():
+    cache_path = CACHE_DIR / f"worker_{os.getpid()}_{time.time_ns()}"
+    cache_path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield cache_path
+    finally:
+        shutil.rmtree(cache_path, ignore_errors=True)
 
 
 def create_default_messages(system_text: Optional[str] = None) -> List[dict]:
@@ -426,12 +573,35 @@ def response_to_text(response: dict) -> str:
     return "".join(texts).strip()
 
 
-def litert_chat_blocking(model_path: Path, user_text: str, *, system_text: Optional[str] = None) -> str:
-    engine = load_litert_engine(model_path)
+def create_user_message(user_text: str, image_path: Optional[str] = None) -> Any:
+    clean_text = sanitize_text(user_text)
+    if not image_path:
+        return clean_text
+
+    safe_image_path = validate_image_path(image_path)
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": clean_text},
+            {"type": "image", "path": str(safe_image_path)},
+        ],
+    }
+
+
+def litert_chat_blocking(
+    model_path: Path,
+    user_text: str,
+    *,
+    system_text: Optional[str] = None,
+    image_path: Optional[str] = None,
+    cache_dir: Optional[Path] = None,
+    enable_vision: bool = False,
+) -> str:
+    engine = load_litert_engine(model_path, cache_dir=cache_dir, enable_vision=enable_vision)
     with engine:
         messages = create_default_messages(system_text)
         with engine.create_conversation(messages=messages) as conversation:
-            return response_to_text(conversation.send_message(user_text))
+            return response_to_text(conversation.send_message(create_user_message(user_text, image_path)))
 
 
 def collect_system_metrics() -> Dict[str, float]:
@@ -582,6 +752,8 @@ def load_settings() -> Dict[str, Any]:
         return dict(DEFAULT_SETTINGS)
     settings = dict(DEFAULT_SETTINGS)
     settings.update({k: raw.get(k, v) for k, v in DEFAULT_SETTINGS.items()})
+    if "enable_native_image_input" not in raw and configured_model_supports_native_image_input():
+        settings["enable_native_image_input"] = True
     return settings
 
 
@@ -602,9 +774,7 @@ def unlocked_model_path(key: bytes):
         try:
             yield RUNTIME_MODEL_PATH
         finally:
-            if RUNTIME_MODEL_PATH.exists():
-                encrypt_file(RUNTIME_MODEL_PATH, ENCRYPTED_MODEL, key)
-                safe_cleanup([RUNTIME_MODEL_PATH])
+            safe_cleanup([RUNTIME_MODEL_PATH])
         return
 
     if MODEL_PATH.exists():
@@ -617,36 +787,61 @@ def unlocked_model_path(key: bytes):
 def build_chat_prompt(user_text: str, memory: List[Tuple[str, str]], turns: int = 6) -> str:
     recent = memory[-max(0, turns * 2) :]
     if not recent:
-        return user_text
+        return sanitize_text(user_text)
 
     lines = ["Conversation so far:"]
     for role, message in recent:
         label = "User" if role == "user" else "Assistant"
-        lines.append(f"{label}: {message}")
+        lines.append(f"{label}: {sanitize_text(message, max_chars=4000)}")
     lines.append("")
-    lines.append(f"User: {user_text}")
+    lines.append(f"User: {sanitize_text(user_text)}")
     lines.append("Assistant:")
     return "\n".join(lines)
 
 
-def run_chat_request(key: bytes, prompt: str, memory: List[Tuple[str, str]], memory_turns: int) -> str:
+def run_chat_request(
+    key: bytes,
+    prompt: str,
+    memory: List[Tuple[str, str]],
+    memory_turns: int,
+    image_path: Optional[str] = None,
+    native_image_input: bool = False,
+) -> str:
     init_db(key)
-    compiled_prompt = build_chat_prompt(prompt, memory, turns=memory_turns)
-    with unlocked_model_path(key) as model_path:
+    clean_prompt = sanitize_text(prompt)
+    safe_image_path = validate_image_path(image_path) if image_path else None
+    native_image_allowed = safe_image_path is not None and native_image_input and configured_model_supports_native_image_input()
+    model_prompt = clean_prompt
+    model_image_path = str(safe_image_path) if native_image_allowed and safe_image_path else None
+    if safe_image_path is not None and not native_image_allowed:
+        model_prompt = clean_prompt + image_metadata_prompt(
+            safe_image_path,
+            native_requested=native_image_input,
+            native_allowed=native_image_allowed,
+        )
+
+    compiled_prompt = build_chat_prompt(model_prompt, memory, turns=memory_turns)
+    with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
         reply = litert_chat_blocking(
             model_path,
             compiled_prompt,
             system_text="You are a warm, concise, helpful assistant running fully on the local machine.",
+            image_path=model_image_path,
+            cache_dir=cache_dir,
+            enable_vision=bool(model_image_path),
         )
-    log_interaction(prompt, reply, key)
+    log_prompt = clean_prompt
+    if safe_image_path is not None:
+        log_prompt = f"{model_prompt}\n[Image attached: {safe_image_path.name}]"
+    log_interaction(log_prompt, sanitize_text(reply), key)
     return reply
 
 
 def run_road_scan(key: bytes, data: Dict[str, str], include_system_entropy: bool) -> Dict[str, str]:
     init_db(key)
     system_text, prompt = build_road_scanner_prompt(data, include_system_entropy=include_system_entropy)
-    with unlocked_model_path(key) as model_path:
-        raw = litert_chat_blocking(model_path, prompt, system_text=system_text)
+    with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
+        raw = litert_chat_blocking(model_path, prompt, system_text=system_text, cache_dir=cache_dir)
     label = normalize_risk_label(raw)
     log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
     return {
@@ -771,6 +966,56 @@ def storage_summary(key: Optional[bytes]) -> Dict[str, str]:
         "history_count": history_count,
         "key_mode": detect_key_mode(),
     }
+
+
+def cleanup_worker_artifacts(*, remove_worker_caches: bool = False) -> None:
+    safe_cleanup([RUNTIME_MODEL_PATH, LEGACY_RUNTIME_MODEL_PATH])
+    for pattern in ("history_*.db",):
+        for path in DB_PATH.parent.glob(pattern):
+            try:
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+            except Exception:
+                pass
+
+    if not remove_worker_caches:
+        return
+
+    for path in CACHE_DIR.glob("worker_*"):
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def describe_process_exit(task_name: str, task_args: Tuple[Any, ...], exit_code: Optional[int]) -> RuntimeError:
+    signal_note = ""
+    if isinstance(exit_code, int) and exit_code < 0:
+        signal_number = abs(exit_code)
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except Exception:
+            signal_name = f"signal {signal_number}"
+        signal_note = f" ({signal_name})"
+
+    detail = (
+        f"Background LiteRT-LM worker crashed with code {exit_code}{signal_note}. "
+        "Temporary runtime model/cache files were cleaned up, and your encrypted vault was not overwritten."
+    )
+    if task_name == "chat_request" and len(task_args) >= 5 and task_args[4]:
+        detail += (
+            "\n\nThis request included an image. If it keeps happening, turn Image mode off for now; "
+            "the current LiteRT-LM runtime/model combination may be crashing on multimodal image input."
+        )
+    else:
+        detail += (
+            "\n\nIf it happens again on text-only prompts, try Verify Hash in Model Lab or re-download the model; "
+            "native segfaults usually point to runtime/model/cache issues rather than Python UI code."
+        )
+    return RuntimeError(detail)
 
 
 PROCESS_TASKS = {
@@ -934,6 +1179,9 @@ class StartupPasswordDialog(DialogBase):
         )
         self.primary_button.pack(side="right")
 
+        self.bind("<Return>", self._handle_return)
+        self.password_entry.bind("<Return>", self._handle_return)
+        self.confirm_entry.bind("<Return>", self._handle_return)
         self.password_entry.focus_set()
 
     def _subtitle_text(self) -> str:
@@ -972,6 +1220,10 @@ class StartupPasswordDialog(DialogBase):
             return
         self.app.complete_unlock(key, "legacy_raw")
         self.destroy()
+
+    def _handle_return(self, _event: Any) -> str:
+        self._submit()
+        return "break"
 
     def _submit(self) -> None:
         password = self.password_var.get().strip()
@@ -1036,6 +1288,12 @@ class HumoidStudioApp(AppBase):
         self.last_scan_result: Optional[Dict[str, str]] = None
         self.history_offset = 0
         self.active_process: Optional[mp.Process] = None
+        self.selected_image_path: Optional[Path] = None
+        self.image_mode_var = tk.BooleanVar(value=False)
+        self.image_status_var = tk.StringVar(value="Image mode off")
+        self.tts_enabled_var = tk.BooleanVar(value=False)
+        self.tts_last_text = ""
+        self.history_search_after_id: Optional[str] = None
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
@@ -1059,6 +1317,7 @@ class HumoidStudioApp(AppBase):
             value=bool(self.settings_data.get("delete_plaintext_after_encrypt", True))
         )
         self.settings_memory_turns_var = tk.IntVar(value=int(self.settings_data.get("chat_memory_turns", 6)))
+        self.settings_native_image_var = tk.BooleanVar(value=bool(self.settings_data.get("enable_native_image_input", False)))
         self.change_current_password_var = tk.StringVar()
         self.change_new_password_var = tk.StringVar()
         self.change_confirm_password_var = tk.StringVar()
@@ -1283,6 +1542,7 @@ class HumoidStudioApp(AppBase):
         except Exception as exc:
             self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}")
         self.refresh_dashboard()
+        self.after(150, self.refresh_history_action)
 
     def ensure_unlocked(self) -> bool:
         if self.key is not None:
@@ -1350,17 +1610,25 @@ class HumoidStudioApp(AppBase):
                     except queue.Empty:
                         if not process.is_alive():
                             exit_code = process.exitcode
+                            try:
+                                kind, payload = result_queue.get(timeout=0.5)
+                                break
+                            except queue.Empty:
+                                pass
+                            cleanup_worker_artifacts(remove_worker_caches=True)
                             self.task_queue.put(
                                 (
                                     "error",
-                                    RuntimeError(f"Background process exited unexpectedly with code {exit_code}."),
+                                    describe_process_exit(task_name, task_args, exit_code),
                                     on_error,
                                 )
                             )
                             return
             finally:
-                process.join(timeout=0.5)
+                process.join(timeout=5.0)
                 result_queue.close()
+                if process.exitcode is not None:
+                    cleanup_worker_artifacts(remove_worker_caches=True)
                 self.active_process = None
 
             if kind == "success":
@@ -1567,6 +1835,37 @@ class HumoidStudioApp(AppBase):
         clear_button.pack()
         self.register_action(clear_button)
 
+        image_switch = ctk.CTkSwitch(
+            actions,
+            text="Image mode",
+            variable=self.image_mode_var,
+            command=self.toggle_image_mode,
+            progress_color=PALETTE["accent_teal"],
+            button_color=PALETTE["accent_teal"],
+            button_hover_color="#00b85c",
+            text_color=PALETTE["text"],
+            font=self.small_font,
+        )
+        image_switch.pack(anchor="w", pady=(14, 8))
+        self.register_action(image_switch)
+
+        image_button = self.make_button(actions, "Select Image", self.select_prompt_image, 2, width=150, height=40)
+        image_button.pack(pady=(0, 8))
+        self.register_action(image_button)
+
+        clear_image_button = self.make_button(actions, "Clear Image", self.clear_prompt_image, 4, width=150, height=38)
+        clear_image_button.pack()
+        self.register_action(clear_image_button)
+
+        ctk.CTkLabel(
+            actions,
+            textvariable=self.image_status_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=150,
+        ).pack(anchor="w", pady=(10, 0))
+
         right = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
         right.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
         right.grid_columnconfigure(0, weight=1)
@@ -1598,15 +1897,46 @@ class HumoidStudioApp(AppBase):
         self.memory_preview.insert("1.0", "No turns yet.\n")
         self.memory_preview.configure(state="disabled")
 
+        tts_card = ctk.CTkFrame(right, fg_color=PALETTE["card_soft"], corner_radius=18, border_width=1, border_color=PALETTE["line"])
+        tts_card.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        tts_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            tts_card,
+            text="Local TTS",
+            font=self.small_font,
+            text_color=PALETTE["text"],
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+
+        tts_switch = ctk.CTkSwitch(
+            tts_card,
+            text="Auto-speak replies",
+            variable=self.tts_enabled_var,
+            progress_color=PALETTE["accent_teal"],
+            button_color=PALETTE["accent_teal"],
+            button_hover_color="#00b85c",
+            text_color=PALETTE["text"],
+            font=self.small_font,
+        )
+        tts_switch.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
+        self.register_action(tts_switch)
+
+        speak_button = self.make_button(tts_card, "Speak Last", self.speak_last_reply, 0, width=130, height=36)
+        speak_button.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 14))
+        self.register_action(speak_button)
+
         hint = ctk.CTkLabel(
             right,
-            text="Tip: keep prompts short and concrete for faster local responses.",
+            text=(
+                "Enter sends. Shift+Enter adds a new line. Image mode validates the file; "
+                "Gemma 4 uses the native LiteRT-LM vision path when native image input is enabled in Settings."
+            ),
             font=self.small_font,
             text_color=PALETTE["muted"],
             justify="left",
             wraplength=320,
         )
-        hint.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 20))
+        hint.grid(row=4, column=0, sticky="w", padx=20, pady=(0, 20))
 
     def build_model_tab(self) -> None:
         tab = self.model_tab
@@ -1810,6 +2140,8 @@ class HumoidStudioApp(AppBase):
         )
         self.history_search_entry.pack(side="left", padx=(0, 10))
         self.register_action(self.history_search_entry)
+        self.history_search_entry.bind("<Return>", self.handle_history_search_return)
+        self.history_search_var.trace_add("write", self.schedule_history_search)
 
         refresh_history = self.make_button(controls, "Refresh", self.refresh_history_action, 2, width=130, height=42)
         refresh_history.pack(side="left", padx=(0, 10))
@@ -1874,6 +2206,31 @@ class HumoidStudioApp(AppBase):
         )
         delete_switch.pack(anchor="w", padx=20, pady=(0, 12))
         self.register_action(delete_switch)
+
+        native_image_switch = ctk.CTkSwitch(
+            look,
+            text="Experimental native image input for multimodal models",
+            variable=self.settings_native_image_var,
+            progress_color=PALETTE["accent_pink"],
+            button_color=PALETTE["accent_pink"],
+            button_hover_color="#48d87d",
+            text_color=PALETTE["text"],
+            font=self.body_font,
+        )
+        native_image_switch.pack(anchor="w", padx=20, pady=(0, 8))
+        self.register_action(native_image_switch)
+
+        ctk.CTkLabel(
+            look,
+            text=(
+                "Gemma 4 LiteRT-LM is multimodal. If this is on, validated image prompts use the native "
+                "LiteRT-LM vision path with a CPU vision backend."
+            ),
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=20, pady=(0, 12))
 
         memory_label = ctk.CTkLabel(
             look,
@@ -1981,13 +2338,14 @@ class HumoidStudioApp(AppBase):
         self.chat_output.configure(state="normal")
         tag = "user_header" if role == "You" else "assistant_header"
         timestamp = time.strftime("%H:%M:%S")
+        safe_message = render_markdown_for_display(message)
         try:
             text_widget = self.chat_output._textbox
             text_widget.insert("end", f"{role}  {timestamp}\n", (tag,))
-            text_widget.insert("end", message.strip() + "\n\n")
+            text_widget.insert("end", safe_message.strip() + "\n\n")
             text_widget.see("end")
         except Exception:
-            self.chat_output.insert("end", f"{role}  {timestamp}\n{message.strip()}\n\n")
+            self.chat_output.insert("end", f"{role}  {timestamp}\n{safe_message.strip()}\n\n")
         self.chat_output.configure(state="disabled")
 
     def refresh_memory_preview(self) -> None:
@@ -1998,7 +2356,7 @@ class HumoidStudioApp(AppBase):
         else:
             for role, message in self.chat_memory[-12:]:
                 label = "You" if role == "user" else "Gemma"
-                self.memory_preview.insert("end", f"{label}: {message}\n\n")
+                self.memory_preview.insert("end", f"{label}: {render_markdown_for_display(message, max_chars=5000)}\n\n")
         self.memory_preview.configure(state="disabled")
 
     def refresh_dashboard(self) -> None:
@@ -2033,7 +2391,120 @@ class HumoidStudioApp(AppBase):
         self.chat_output.delete("1.0", "end")
         self.chat_output.insert("1.0", "Chat cleared. The local vault is still ready.\n\n")
         self.chat_output.configure(state="disabled")
+        self.tts_last_text = ""
         self.refresh_memory_preview()
+
+    def toggle_image_mode(self) -> None:
+        if self.image_mode_var.get():
+            if self.selected_image_path is None:
+                self.image_status_var.set("Image mode: select a file")
+            else:
+                suffix = "native" if self.native_image_input_active() else "metadata"
+                self.image_status_var.set(f"Image: {self.selected_image_path.name} ({suffix})")
+        else:
+            self.image_status_var.set("Image mode off")
+
+    def native_image_input_active(self) -> bool:
+        return bool(self.settings_native_image_var.get()) and configured_model_supports_native_image_input()
+
+    def select_prompt_image(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        if not self.image_mode_var.get():
+            self.image_mode_var.set(True)
+
+        if filedialog is None:
+            if messagebox:
+                messagebox.showwarning("Image picker unavailable", "File dialog support is not available in this environment.")
+            return
+
+        selected = filedialog.askopenfilename(
+            title="Select image for prompt",
+            filetypes=[
+                ("Safe image inputs", "*.jpg *.jpeg *.png *.webp"),
+                ("JPEG", "*.jpg *.jpeg"),
+                ("PNG", "*.png"),
+                ("WebP", "*.webp"),
+            ],
+        )
+        if not selected:
+            self.toggle_image_mode()
+            return
+
+        try:
+            self.selected_image_path = validate_image_path(selected)
+        except Exception as exc:
+            self.selected_image_path = None
+            self.image_status_var.set("Image rejected")
+            if messagebox:
+                messagebox.showwarning("Image rejected", str(exc))
+            return
+
+        suffix = "native" if self.native_image_input_active() else "metadata"
+        self.image_status_var.set(f"Image: {self.selected_image_path.name} ({suffix})")
+        if suffix == "metadata":
+            self.status_var.set("Image validated. This model will receive safe metadata only, not pixels.")
+        else:
+            self.status_var.set("Image selected and validated for native multimodal input.")
+
+    def clear_prompt_image(self) -> None:
+        self.selected_image_path = None
+        self.image_mode_var.set(False)
+        self.image_status_var.set("Image mode off")
+
+    def speak_text(self, text: str) -> None:
+        safe_text = render_markdown_for_display(text, max_chars=8000)
+        if not safe_text:
+            return
+
+        def worker() -> None:
+            try:
+                self.speak_text_blocking(safe_text)
+            except Exception as exc:
+                self.task_queue.put(("error", exc, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def speak_text_blocking(self, safe_text: str) -> None:
+        global pyttsx3, PYTTSX3_IMPORT_ERROR
+        espeak_ng = shutil.which("espeak-ng")
+        if espeak_ng:
+            completed = subprocess.run(
+                [espeak_ng, "-s", "175", "--stdin"],
+                input=safe_text,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return
+            stderr = sanitize_text(completed.stderr, max_chars=1200)
+            alsa_hint = " Install the Ubuntu package `alsa-utils` so `aplay` is available." if shutil.which("aplay") is None else ""
+            raise RuntimeError(f"espeak-ng failed with code {completed.returncode}.{alsa_hint}\n{stderr}")
+
+        if pyttsx3 is None and PYTTSX3_IMPORT_ERROR is None:
+            try:
+                import pyttsx3 as pyttsx3_module
+            except Exception as exc:
+                PYTTSX3_IMPORT_ERROR = exc
+            else:
+                pyttsx3 = pyttsx3_module
+
+        if pyttsx3 is None:
+            detail = f" pyttsx3 import error: {PYTTSX3_IMPORT_ERROR}" if PYTTSX3_IMPORT_ERROR else ""
+            raise RuntimeError(
+                "TTS is unavailable. Install `espeak-ng` and `alsa-utils`, or install `pyttsx3` in the active venv."
+                + detail
+            )
+
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 175)
+        engine.say(safe_text)
+        engine.runAndWait()
+
+    def speak_last_reply(self) -> None:
+        self.speak_text(self.tts_last_text)
 
     def handle_chat_return(self, _event: Any) -> str:
         self.submit_chat()
@@ -2045,27 +2516,49 @@ class HumoidStudioApp(AppBase):
     def submit_chat(self) -> None:
         if not self.ensure_unlocked():
             return
-        prompt = self.chat_input.get("1.0", "end").strip()
-        if not prompt:
+        prompt = sanitize_text(self.chat_input.get("1.0", "end")).strip()
+        image_path = str(self.selected_image_path) if self.image_mode_var.get() and self.selected_image_path else None
+        if not prompt and not image_path:
             return
+        if image_path and not prompt:
+            prompt = "Describe this image."
 
         memory_snapshot = list(self.chat_memory)
         memory_turns = int(self.settings_data.get("chat_memory_turns", 6))
-        self.append_chat_message("You", prompt)
+        native_image_input = bool(self.settings_native_image_var.get()) and configured_model_supports_native_image_input()
+        display_prompt = prompt
+        if image_path:
+            mode = "native" if native_image_input else "metadata"
+            display_prompt = f"{prompt}\n[Image attached: {Path(image_path).name} | {mode} mode]"
+        self.append_chat_message("You", display_prompt)
         self.chat_input.delete("1.0", "end")
         self.status_var.set("Sending prompt to the local model...")
 
         def on_success(reply: str) -> None:
-            self.chat_memory.extend([("user", prompt), ("assistant", reply)])
-            self.append_chat_message("Gemma", reply)
+            safe_reply = sanitize_text(reply)
+            memory_prompt = display_prompt if image_path else prompt
+            self.chat_memory.extend([("user", memory_prompt), ("assistant", safe_reply)])
+            self.tts_last_text = safe_reply
+            self.append_chat_message("Gemma", safe_reply)
             self.refresh_memory_preview()
             self.status_var.set("Reply ready. The model vault has been sealed again.")
+            if self.tts_enabled_var.get():
+                self.speak_text(safe_reply)
+
+        def on_error(exc: Exception) -> None:
+            self.status_var.set(str(exc))
+            if image_path:
+                self.clear_prompt_image()
+                self.image_status_var.set("Image mode off after worker crash")
+            if messagebox:
+                messagebox.showerror("Generation failed", str(exc))
 
         self.run_process_task(
             "Generating a local reply...",
             "chat_request",
-            (self.key, prompt, memory_snapshot, memory_turns),
+            (self.key, prompt, memory_snapshot, memory_turns, image_path, native_image_input),
             on_success=on_success,
+            on_error=on_error,
         )
 
     def download_model_action(self) -> None:
@@ -2156,7 +2649,9 @@ class HumoidStudioApp(AppBase):
             self.road_detail_box.delete("1.0", "end")
             self.road_detail_box.insert(
                 "1.0",
-                f"Timestamp: {result['timestamp']}\n\nPrompt:\n{result['prompt']}\n\nRaw model output:\n{result['raw']}\n",
+                f"Timestamp: {sanitize_text(result['timestamp'], max_chars=80)}\n\n"
+                f"Prompt:\n{render_markdown_for_display(result['prompt'], max_chars=8000)}\n\n"
+                f"Raw model output:\n{render_markdown_for_display(result['raw'], max_chars=4000)}\n",
             )
             self.road_detail_box.configure(state="disabled")
             self.road_export_button.configure(state="normal")
@@ -2189,6 +2684,12 @@ class HumoidStudioApp(AppBase):
         self.status_var.set(f"Road scan exported to {target}.")
 
     def refresh_history_action(self) -> None:
+        if self.history_search_after_id is not None:
+            try:
+                self.after_cancel(self.history_search_after_id)
+            except Exception:
+                pass
+            self.history_search_after_id = None
         self.history_offset = 0
         self.load_history_page()
 
@@ -2200,10 +2701,28 @@ class HumoidStudioApp(AppBase):
         self.history_offset = max(0, self.history_offset - 12)
         self.load_history_page()
 
+    def handle_history_search_return(self, _event: Any) -> str:
+        self.refresh_history_action()
+        return "break"
+
+    def schedule_history_search(self, *_args: Any) -> None:
+        if self.key is None:
+            return
+        if self.history_search_after_id is not None:
+            try:
+                self.after_cancel(self.history_search_after_id)
+            except Exception:
+                pass
+        self.history_search_after_id = self.after(450, self.run_scheduled_history_search)
+
+    def run_scheduled_history_search(self) -> None:
+        self.history_search_after_id = None
+        self.refresh_history_action()
+
     def load_history_page(self) -> None:
         if not self.ensure_unlocked():
             return
-        search = self.history_search_var.get().strip() or None
+        search = sanitize_text(self.history_search_var.get(), max_chars=300).strip() or None
         offset_snapshot = self.history_offset
 
         def on_success(rows: List[Tuple[int, str, str, str]]) -> None:
@@ -2228,7 +2747,10 @@ class HumoidStudioApp(AppBase):
             for row_id, stamp, prompt, response in rows:
                 self.history_box.insert(
                     "end",
-                    f"[{row_id}] {stamp}\nPrompt:\n{prompt}\n\nResponse:\n{response}\n\n{'-' * 72}\n\n",
+                    f"[{row_id}] {sanitize_text(stamp, max_chars=80)}\n"
+                    f"Prompt:\n{render_markdown_for_display(prompt, max_chars=8000)}\n\n"
+                    f"Response:\n{render_markdown_for_display(response, max_chars=12000)}\n\n"
+                    f"{'-' * 72}\n\n",
                 )
         self.history_box.configure(state="disabled")
         self.status_var.set("Encrypted history loaded.")
@@ -2237,6 +2759,7 @@ class HumoidStudioApp(AppBase):
         self.settings_data["include_system_entropy"] = bool(self.settings_entropy_var.get())
         self.settings_data["delete_plaintext_after_encrypt"] = bool(self.settings_delete_plaintext_var.get())
         self.settings_data["chat_memory_turns"] = int(self.settings_memory_turns_var.get())
+        self.settings_data["enable_native_image_input"] = bool(self.settings_native_image_var.get())
         save_settings(self.settings_data)
         self.status_var.set("Settings saved.")
 
@@ -2281,6 +2804,7 @@ class HumoidStudioApp(AppBase):
         )
 
     def lock_studio(self) -> None:
+        cleanup_worker_artifacts(remove_worker_caches=True)
         self.key = None
         self.key_mode = "locked"
         self.key_status_var.set("Key: Locked")
@@ -2297,12 +2821,7 @@ class HumoidStudioApp(AppBase):
             if messagebox:
                 messagebox.showinfo("Task running", "Please wait for the current task to finish before closing the studio.")
             return
-        if RUNTIME_MODEL_PATH.exists() and self.key is not None:
-            try:
-                encrypt_file(RUNTIME_MODEL_PATH, ENCRYPTED_MODEL, self.key)
-                safe_cleanup([RUNTIME_MODEL_PATH])
-            except Exception:
-                pass
+        cleanup_worker_artifacts(remove_worker_caches=True)
         self.destroy()
 
 

@@ -28,7 +28,7 @@ mkdir -p "$PROOT_TMP_DIR"
 echo "Setting up sudouser + Python + Humoid-Gui-Gemma repo..."
 proot-distro login ubuntu -- <<'EOF'
 apt update && apt upgrade -y
-apt install -y sudo python3 python3-pip python3-venv python3-tk git nano curl
+apt install -y sudo python3 python3-pip python3-venv python3-tk espeak-ng alsa-utils libespeak1 git nano curl
 
 # Create sudouser (no password)
 adduser --disabled-password --gecos "" sudouser
@@ -42,7 +42,11 @@ su - sudouser -c "
     python3 -m venv venv
     . venv/bin/activate
     pip install --upgrade pip
-    [ -f requirements.txt ] && pip install -r requirements.txt || true
+    if [ -f requirements.txt ]; then
+        pip install -r requirements.txt
+    elif [ -f requirements.in ]; then
+        pip install -r requirements.in
+    fi
     chmod +x main.py
 "
 

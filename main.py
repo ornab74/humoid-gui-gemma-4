@@ -1836,7 +1836,7 @@ class HumoidStudioApp(AppBase):
             chat_font_size_setting = int(self.settings_data.get("chat_font_size", 13))
         except Exception:
             chat_font_size_setting = 13
-        self.settings_chat_font_size_var = tk.IntVar(value=max(10, min(22, chat_font_size_setting)))
+        self.settings_chat_font_size_var = tk.IntVar(value=max(9, min(28, chat_font_size_setting)))
         self.chat_font_size_label_var = tk.StringVar()
         self.chat_input_stats_var = tk.StringVar(value="0 chars | 0 lines | Shift+Enter for newline")
         self.settings_native_image_var = tk.BooleanVar(value=bool(self.settings_data.get("enable_native_image_input", False)))
@@ -1865,7 +1865,7 @@ class HumoidStudioApp(AppBase):
         self.bind("<Configure>", self.draw_background)
 
         self.shell = ctk.CTkFrame(self, fg_color="transparent")
-        self.shell.pack(fill="both", expand=True, padx=24, pady=24)
+        self.shell.pack(fill="both", expand=True, padx=18, pady=18)
 
         self.action_widgets: List[Any] = []
         self.progress_mode = "indeterminate"
@@ -1887,12 +1887,12 @@ class HumoidStudioApp(AppBase):
             border_width=1,
             border_color=PALETTE["line"],
         )
-        self.hero.grid(row=0, column=0, sticky="nsew", pady=(0, 18))
+        self.hero.grid(row=0, column=0, sticky="nsew", pady=(0, 14))
         self.hero.grid_columnconfigure(0, weight=1)
         self.hero.grid_columnconfigure(1, weight=0)
 
         left = ctk.CTkFrame(self.hero, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="nsew", padx=24, pady=20)
+        left.grid(row=0, column=0, sticky="nsew", padx=24, pady=14)
 
         ctk.CTkLabel(
             left,
@@ -1901,22 +1901,8 @@ class HumoidStudioApp(AppBase):
             text_color=PALETTE["text"],
         ).pack(anchor="w")
 
-        ctk.CTkLabel(
-            left,
-            text="Human Androids",
-            font=self.body_font,
-            text_color=PALETTE["muted"],
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", pady=(8, 18))
-
-        chips = ctk.CTkFrame(left, fg_color="transparent")
-        chips.pack(anchor="w")
-        self.make_chip(chips, self.key_status_var, PALETTE["accent_orange"]).pack(side="left", padx=(0, 10))
-        self.make_chip(chips, self.model_status_var, PALETTE["accent_teal"]).pack(side="left")
-
         right = ctk.CTkFrame(self.hero, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="ne", padx=24, pady=20)
+        right.grid(row=0, column=1, sticky="ne", padx=24, pady=14)
 
         self.progress_bar = ctk.CTkProgressBar(
             right,
@@ -2234,7 +2220,7 @@ class HumoidStudioApp(AppBase):
                 value = int(self.settings_data.get("chat_font_size", 13))
             except Exception:
                 value = 13
-        return max(10, min(22, value))
+        return max(9, min(28, value))
 
     def update_chat_font_label(self) -> None:
         try:
@@ -2936,15 +2922,11 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
 
         left = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
         self.chat_main_frame = left
-        left.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
-        left.grid_rowconfigure(1, weight=1)
+        left.grid(row=0, column=1, sticky="nsew", padx=14, pady=14)
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_rowconfigure(1, weight=0)
         left.grid_rowconfigure(2, weight=0)
-        left.grid_rowconfigure(3, weight=0)
         left.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(left, text="Chat", font=self.section_font, text_color=PALETTE["text"]).grid(
-            row=0, column=0, sticky="w", padx=20, pady=(18, 12)
-        )
 
         self.chat_output = ctk.CTkTextbox(
             left,
@@ -2956,12 +2938,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             font=self.body_font,
             wrap="word",
         )
-        self.chat_output.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 16))
+        self.chat_output.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 12))
         self.chat_output.configure(state="disabled")
         self.configure_textbox_tags(self.chat_output, base_size=self.chat_font_size())
 
         compose = ctk.CTkFrame(left, fg_color="transparent")
-        compose.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
+        compose.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
         compose.grid_columnconfigure(0, weight=1)
         compose.grid_columnconfigure(1, weight=0)
 
@@ -2982,7 +2964,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_input.bind("<Shift-Return>", self.handle_chat_shift_return)
         self.chat_input.bind("<KeyRelease>", self.update_chat_input_stats)
 
-        send_button = self.make_button(compose, "Send Prompt", self.submit_chat, 1, width=150, height=118)
+        send_button = self.make_button(compose, "Send", self.submit_chat, 1, width=118, height=118)
         send_button.grid(row=0, column=1, sticky="ns", padx=(14, 0))
         self.register_action(send_button)
 
@@ -2994,13 +2976,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         toolbar = ctk.CTkFrame(left, fg_color=PALETTE["card_soft"], corner_radius=18, border_width=1, border_color=PALETTE["line"])
-        toolbar.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
-        for column_index in (0, 1, 2, 3):
+        toolbar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+        for column_index in (0, 1, 2):
             toolbar.grid_columnconfigure(column_index, weight=1)
-        toolbar.grid_columnconfigure(4, weight=2)
 
         session_group = ctk.CTkFrame(toolbar, fg_color="transparent")
-        session_group.grid(row=0, column=0, sticky="w", padx=(14, 8), pady=(12, 8))
+        session_group.grid(row=0, column=0, sticky="w", padx=(14, 8), pady=(12, 6))
         ctk.CTkLabel(
             session_group,
             text="Session",
@@ -3017,7 +2998,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.register_action(clear_button)
 
         drawer_group = ctk.CTkFrame(toolbar, fg_color="transparent")
-        drawer_group.grid(row=0, column=1, sticky="w", padx=8, pady=(12, 8))
+        drawer_group.grid(row=0, column=1, sticky="w", padx=8, pady=(12, 6))
         ctk.CTkLabel(
             drawer_group,
             text="Drawers",
@@ -3048,7 +3029,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.register_action(self.memory_toggle_button)
 
         prompt_group = ctk.CTkFrame(toolbar, fg_color="transparent")
-        prompt_group.grid(row=0, column=2, sticky="w", padx=8, pady=(12, 8))
+        prompt_group.grid(row=0, column=2, sticky="w", padx=(8, 14), pady=(12, 6))
         ctk.CTkLabel(
             prompt_group,
             text="Prompt",
@@ -3056,12 +3037,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             text_color=PALETTE["muted"],
         ).pack(side="left", padx=(0, 8))
 
-        clear_input_button = self.make_button(prompt_group, "Clear Input", self.clear_chat_input, 3, width=112, height=36)
+        clear_input_button = self.make_button(prompt_group, "Clear Input", self.clear_chat_input, 3, width=118, height=36)
         clear_input_button.pack(side="left")
         self.register_action(clear_input_button)
 
         image_group = ctk.CTkFrame(toolbar, fg_color="transparent")
-        image_group.grid(row=0, column=3, sticky="w", padx=8, pady=(12, 8))
+        image_group.grid(row=1, column=0, columnspan=2, sticky="w", padx=(14, 8), pady=(4, 8))
         ctk.CTkLabel(
             image_group,
             text="Image",
@@ -3083,16 +3064,16 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         image_switch.pack(side="left", padx=(0, 12))
         self.register_action(image_switch)
 
-        image_button = self.make_button(image_group, "Select", self.select_prompt_image, 2, width=94, height=36)
+        image_button = self.make_button(image_group, "Select Image", self.select_prompt_image, 2, width=118, height=36)
         image_button.pack(side="left", padx=(0, 8))
         self.register_action(image_button)
 
-        clear_image_button = self.make_button(image_group, "Clear", self.clear_prompt_image, 4, width=88, height=36)
+        clear_image_button = self.make_button(image_group, "Clear Image", self.clear_prompt_image, 4, width=112, height=36)
         clear_image_button.pack(side="left")
         self.register_action(clear_image_button)
 
         voice_group = ctk.CTkFrame(toolbar, fg_color="transparent")
-        voice_group.grid(row=0, column=4, sticky="e", padx=(8, 14), pady=(12, 8))
+        voice_group.grid(row=1, column=2, sticky="e", padx=(8, 14), pady=(4, 8))
         ctk.CTkLabel(
             voice_group,
             text="Reply",
@@ -3113,11 +3094,11 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         tts_switch.pack(side="left", padx=(0, 10))
         self.register_action(tts_switch)
 
-        copy_last_button = self.make_button(voice_group, "Copy Last", self.copy_last_reply, 4, width=104, height=36)
+        copy_last_button = self.make_button(voice_group, "Copy Reply", self.copy_last_reply, 4, width=112, height=36)
         copy_last_button.pack(side="left", padx=(0, 8))
         self.register_action(copy_last_button)
 
-        speak_button = self.make_button(voice_group, "Speak Last", self.speak_last_reply, 5, width=110, height=36)
+        speak_button = self.make_button(voice_group, "Speak", self.speak_last_reply, 5, width=92, height=36)
         speak_button.pack(side="left")
         self.register_action(speak_button)
 
@@ -3128,7 +3109,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             text_color=PALETTE["muted"],
             justify="left",
             wraplength=980,
-        ).grid(row=1, column=0, columnspan=5, sticky="ew", padx=14, pady=(0, 12))
+        ).grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(0, 12))
 
         right = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
         self.memory_panel = right
@@ -3180,8 +3161,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_tab.grid_columnconfigure(0, weight=1 if getattr(self, "history_index_visible", False) else 0)
         self.chat_tab.grid_columnconfigure(1, weight=4)
         self.chat_tab.grid_columnconfigure(2, weight=2)
-        self.chat_main_frame.grid_configure(padx=(20, 10))
-        self.memory_panel.grid(row=0, column=2, sticky="nsew", padx=(10, 20), pady=20)
+        self.chat_main_frame.grid_configure(padx=(14, 8))
+        self.memory_panel.grid(row=0, column=2, sticky="nsew", padx=(8, 14), pady=14)
         try:
             self.memory_toggle_button.configure(text="Hide Memory")
         except Exception:
@@ -3196,7 +3177,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_tab.grid_columnconfigure(0, weight=1 if getattr(self, "history_index_visible", False) else 0)
         self.chat_tab.grid_columnconfigure(1, weight=1)
         self.chat_tab.grid_columnconfigure(2, weight=0)
-        self.chat_main_frame.grid_configure(padx=(20, 10) if getattr(self, "history_index_visible", False) else 20)
+        self.chat_main_frame.grid_configure(padx=(8, 8) if getattr(self, "history_index_visible", False) else 14)
         try:
             self.memory_toggle_button.configure(text="Memory")
         except Exception:
@@ -3215,8 +3196,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_tab.grid_columnconfigure(0, weight=1)
         self.chat_tab.grid_columnconfigure(1, weight=4)
         self.chat_tab.grid_columnconfigure(2, weight=2 if getattr(self, "memory_panel_visible", False) else 0)
-        self.history_index_panel.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
-        self.chat_main_frame.grid_configure(padx=(10, 10 if getattr(self, "memory_panel_visible", False) else 20))
+        self.history_index_panel.grid(row=0, column=0, sticky="nsew", padx=(14, 8), pady=14)
+        self.chat_main_frame.grid_configure(padx=(8, 8 if getattr(self, "memory_panel_visible", False) else 14))
         try:
             self.history_index_toggle_button.configure(text="Hide Index")
         except Exception:
@@ -3231,7 +3212,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_tab.grid_columnconfigure(0, weight=0)
         self.chat_tab.grid_columnconfigure(1, weight=1 if not getattr(self, "memory_panel_visible", False) else 4)
         self.chat_tab.grid_columnconfigure(2, weight=2 if getattr(self, "memory_panel_visible", False) else 0)
-        self.chat_main_frame.grid_configure(padx=(20, 10) if getattr(self, "memory_panel_visible", False) else 20)
+        self.chat_main_frame.grid_configure(padx=(14, 8) if getattr(self, "memory_panel_visible", False) else 14)
         try:
             self.history_index_toggle_button.configure(text="History")
         except Exception:
@@ -3774,9 +3755,9 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
 
         chat_font_slider = ctk.CTkSlider(
             look,
-            from_=10,
-            to=22,
-            number_of_steps=12,
+            from_=9,
+            to=28,
+            number_of_steps=19,
             variable=self.settings_chat_font_size_var,
             command=self.apply_chat_font_size,
             progress_color=PALETTE["accent_gold"],
@@ -3788,7 +3769,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
 
         ctk.CTkLabel(
             look,
-            text="Adjusts the Chat input and rendered conversation font live.",
+            text="Adjusts the Chat input and rendered conversation font live. Range: 9 to 28 px.",
             font=self.small_font,
             text_color=PALETTE["muted"],
             justify="left",

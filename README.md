@@ -1,149 +1,203 @@
-# Humoid-Gui-Gemma
+# Humoids
 
-Encrypted local AI CLI/TUI built around **LiteRT-LM** and a local **Gemma** LiteRT-LM model.
+Private local AI desktop app for running a Gemma LiteRT-LM model with an encrypted model vault, encrypted chat history, a polished CustomTkinter UI, and local-first workflows.
 
-Humoid-Gui-Gemma is a terminal-first app focused on:
+Humoids is built around a simple normal-user flow:
 
-- encrypted local model storage
-- encrypted chat history
-- interactive TUI workflows
-- local inferencing through `litert-lm`
-- optional road-risk classification flow
-- repeatable dependency locking with GitHub Actions
-- post-quantum signing for generated lock artifacts
+1. Create or enter a vault password.
+2. Download and encrypt the configured Gemma model from the `Download Model` tab.
+3. Chat locally, browse saved conversations, or run the Road Scanner.
+4. Keep local model files, settings, and encrypted history under your control.
 
----
+## Screenshots
 
-# Screenshots
-
-### Humoid GUI - Gemma 4
-
-![Demo Screenshot](https://github.com/ornab74/humoid-gui-gemma-4/blob/main/demo.png)
-
+![Dashboard Screenshot](https://github.com/ornab74/humoid-gui-gemma-4/blob/main/demo.png)
 
 ![Chat Running](https://github.com/ornab74/humoid-gui-gemma-4/blob/main/demo2.png)
-## What it does
 
-Humoid-Gui-Gemma downloads a LiteRT-LM model, verifies its SHA256 checksum, encrypts it at rest, decrypts it only when needed, runs inference locally, then re-encrypts the model after use.
+## Current App Flow
 
-It also stores chat history in an encrypted SQLite database and provides menu-driven flows for:
+```mermaid
+flowchart TD
+    A[Launch Humoids] --> B[Vault Password Dialog]
+    B --> C{Vault Exists?}
+    C -->|No| D[Create Passphrase Key]
+    C -->|Yes| E[Unlock Existing Key]
+    D --> F[Open Download Model]
+    E --> G[Dashboard]
+    F --> H[Download and Verify Gemma]
+    H --> I[Encrypt Model Vault]
+    I --> G
+    G --> J[Chat]
+    G --> K[History]
+    G --> L[Road Scanner]
+    G --> M[Settings]
+    J --> N[Encrypted History]
+    K --> N
+    L --> N
+```
 
-- model management
-- chatting with the model
-- road scanner classification
-- browsing encrypted chat history
-- rotating encryption keys
+## What It Does
 
----
+- Runs a local Gemma LiteRT-LM model through `litert-lm`.
+- Stores the model encrypted at rest as `models/*.litertlm.aes`.
+- Uses a temporary runtime model copy only when the model needs to run.
+- Stores chat and Road Scanner history in an encrypted SQLite database.
+- Provides a dashboard with recent conversation cards.
+- Provides a Chat tab with collapsible side drawers for the History Index and Session Memory.
+- Loads the History Index quickly from encrypted SQLite metadata, not from the LLM.
+- Renders Markdown-style replies, code blocks with copy buttons, and common LaTeX/math forms.
+- Supports optional image attachment metadata/native image input when the configured model/runtime supports it.
+- Supports optional text-to-speech with `espeak-ng` or `pyttsx3`.
+- Includes a GitHub Actions dependency lock workflow with PQ-signed lock metadata.
 
-## Core features
+## Tabs
 
-### Secure model handling
+| Tab | Purpose |
+| --- | --- |
+| `Dashboard` | Vault state, history count, QID mood signal, and recent conversation cards. |
+| `Chat` | Local chat interface with copy buttons, prompt stats, responsive controls, history drawer, and memory drawer. |
+| `Road Scanner` | Local Low / Medium / High risk classification flow for driving-scene notes. |
+| `History` | Searchable encrypted history viewer with copy buttons for prompts and replies. |
+| `Download Model` | Download, verify, encrypt, verify hash, and remove plaintext model copies. |
+| `Settings` | Prompt style, response depth, strict formatting, chat font size, memory turns, image mode, and password rotation. |
+| `About` | In-app beginner, programmer, and deeper technical explanations. |
 
-- downloads a model from a configured repository
-- verifies the downloaded file against an expected SHA256 hash
-- encrypts the model with AES-GCM
-- removes plaintext model files after use
+## Chat Runtime Diagram
 
-### Encrypted chat history
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant G as CustomTkinter GUI
+    participant W as Worker Process
+    participant M as Encrypted Model Vault
+    participant L as LiteRT-LM Engine
+    participant D as Encrypted SQLite History
 
-- stores interactions in SQLite
-- encrypts the database file on disk
-- decrypts only for read/write operations
+    U->>G: Type prompt and press Send
+    G->>G: Keep input editable for drafting
+    G->>W: Spawn local generation task
+    W->>M: Decrypt temporary runtime model copy
+    W->>L: Send system prompt, memory, text, optional image
+    L-->>W: Return model reply
+    W->>D: Log prompt and reply
+    W->>M: Remove temporary runtime model copy
+    W-->>G: Return safe reply text
+    G-->>U: Render Markdown, code buttons, and math
+```
 
-### LiteRT-LM runtime
+## Storage Model
 
-- uses `litert-lm` instead of `llama-cpp-python`
-- targets a LiteRT-LM model artifact such as:
-  - `litert-community/gemma-4-E2B-it-litert-lm`
-- uses the LiteRT-LM conversation engine for prompting and responses
+```mermaid
+flowchart LR
+    P[Vault Password] --> K[PBKDF2-HMAC-SHA256 Key]
+    K --> M[models/*.litertlm.aes]
+    K --> D[chat_history.db.aes]
+    S[gui_settings.json] --> UI[Local UI Preferences]
+    C[.litert_lm_cache/] --> R[Runtime Cache]
 
-### TUI workflow
+    M --> T[Temporary Runtime Model]
+    T --> E[LiteRT-LM Engine]
+    E --> O[Reply Text]
+    O --> D
+```
 
-- keyboard-driven terminal menu
-- model manager
-- interactive chat session
-- road scanner workflow
-- history viewer
-- key rotation flow
+## Chat And History UX
 
-### Supply-chain locking
+```mermaid
+flowchart TD
+    A[Chat Tab] --> B[Large Transcript]
+    A --> C[Prompt Box]
+    A --> D[Compact Button Groups]
+    A --> E[History Index Drawer]
+    A --> F[Session Memory Drawer]
 
-- `requirements.in` is the human-maintained dependency source
-- GitHub Actions compiles a fully pinned `requirements.txt`
-- lock artifacts are signed and uploaded
-- generated lock outputs can be committed back to the repository
+    D --> D1[Session Controls]
+    D --> D2[History and Memory Toggles]
+    D --> D3[Image Controls]
+    D --> D4[Reply Copy and TTS]
 
----
+    E --> E1[Timestamp]
+    E --> E2[First Prompt Preview]
+    E --> E3[Open Conversation]
 
-## Repository layout
+    F --> F1[Recent User Messages]
+    F --> F2[Recent Gemma Replies]
+```
+
+## Markdown And Math Rendering
+
+The chat renderer supports a practical subset of Markdown and math-oriented text:
+
+- headings
+- bold and italic text
+- inline code
+- fenced code blocks with `Copy code`
+- links and image-link placeholders
+- blockquotes
+- ordered and unordered lists
+- horizontal rules
+- inline math with `$...$` and `\(...\)`
+- display math with `$$...$$`, `\[...\]`, and common `\begin{equation}` / `\begin{align}` blocks
+
+The math renderer is intentionally lightweight. It converts common LaTeX commands, fractions, square roots, Greek letters, and simple super/subscripts into readable text for the Tk text widget. It is not a full TeX engine.
+
+## Security Notes
+
+- The vault password is not sent to the model.
+- Passphrase keys use PBKDF2-HMAC-SHA256 with a stored salt.
+- Model and history files use AES-GCM encryption.
+- The encrypted model remains the source of truth.
+- Temporary runtime model files are cleaned up after worker use.
+- Image inputs are validated by path type, extension, size, and magic bytes.
+- The app logs image metadata/filename context, not raw image bytes.
+- Local UI settings in `gui_settings.json` are convenience settings, not secrets.
+
+## Local Files
+
+These are local runtime artifacts and should not be committed:
+
+```text
+.enc_key
+chat_history.db.aes
+gui_settings.json
+.litert_lm_cache/
+models/*.litertlm
+models/*.litertlm.aes
+models/*.runtime
+models/runtime-*
+*.profraw
+```
+
+The repository already ignores these categories in `.gitignore`.
+
+## Repository Layout
 
 ```text
 .
 ├── main.py
+├── README.md
 ├── requirements.in
 ├── requirements.txt
-├── install_ubuntu_humoid_gui_gemma_4.sh
-├── install_termux_humoid_gui_gemma_4.sh
-├── models/
+├── lock.manifest.json
+├── lock.manifest.pqsig
+├── pq_pubkey.b64
+├── demo.png
+├── demo2.png
+├── termux-naza-autosetup/
+│   ├── termux-install.sh
+│   └── ubuntu-install.sh
 ├── .github/
 │   └── workflows/
-│       └── lock-and-pq-sign-lockfile.yml
-└── README.md
+│       └── lock-requirements.yml
+└── models/
 ```
 
----
+## Requirements
 
-## How it works
+Python dependencies are maintained in `requirements.in` and locked in `requirements.txt`.
 
-### 1. Key management
-
-On first run, the app creates or derives an encryption key.
-
-It supports:
-
-- random AES key generation
-- passphrase-derived key generation with PBKDF2
-
-### 2. Model download and verification
-
-The configured model file is downloaded and checked against `EXPECTED_HASH`.
-
-If the checksum does not match, the workflow stops unless the operator explicitly keeps the file.
-
-### 3. Model encryption at rest
-
-The plaintext model is encrypted to `*.aes` using AES-GCM.
-
-The plaintext copy can then be removed.
-
-### 4. Runtime inference
-
-When a chat or scan session starts:
-
-1. the encrypted model is decrypted temporarily
-2. LiteRT-LM loads the `.litertlm` model
-3. the conversation runs locally
-4. the model is unloaded
-5. the plaintext model is re-encrypted and deleted
-
-### 5. Encrypted history logging
-
-Prompts and responses are saved into an encrypted SQLite database.
-
----
-
-## Installation
-
-This section combines the previous install guide into the main README.
-
-### Requirements
-
-#### Python dependencies
-
-The project uses a pinned `requirements.in` that is compiled into a locked `requirements.txt`.
-
-Current direct dependencies:
+Current direct Python dependencies:
 
 ```text
 litert-lm==0.10.1
@@ -152,82 +206,27 @@ aiosqlite==0.21.0
 cryptography==46.0.1
 psutil==6.1.1
 pennylane==0.41.0
+customtkinter==5.2.2
+bleach==6.3.0
+pyttsx3==2.99
 ```
 
-#### Model format
-
-This project is intended to use a LiteRT-LM model file:
-
-- `.litertlm`
-
-Example target:
-
-- `litert-community/gemma-4-E2B-it-litert-lm`
-
-### Ubuntu / Debian install
-
-Use this installer:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-APP_DIR="$HOME/humoid-gui-gemma-4"
-VENV_DIR="$APP_DIR/venv"
-REPO_URL="https://github.com/ornab74/humoid-gui-gemma-4.git"
-
-echo "Updating system packages..."
-sudo apt update
-sudo apt upgrade -y
-
-echo "Installing required packages..."
-sudo apt install -y \
-    git \
-    curl \
-    wget \
-    nano \
-    python3 \
-    python3-pip \
-    python3-venv
-
-echo "Cloning or updating Humoid-Gui-Gemma-4 repo..."
-mkdir -p "$APP_DIR"
-
-if [ -d "$APP_DIR/.git" ]; then
-    git -C "$APP_DIR" pull --ff-only
-else
-    git clone "$REPO_URL" "$APP_DIR"
-fi
-
-echo "Creating Python virtual environment..."
-python3 -m venv "$VENV_DIR"
-
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip
-
-if [ -f "$APP_DIR/requirements.txt" ]; then
-    pip install -r "$APP_DIR/requirements.txt"
-elif [ -f "$APP_DIR/requirements.in" ]; then
-    pip install -r "$APP_DIR/requirements.in"
-fi
-
-chmod +x "$APP_DIR/main.py" 2>/dev/null || true
-
-echo
-echo "Setup complete."
-echo "Run with:"
-echo "cd \"$APP_DIR\""
-echo "source venv/bin/activate"
-echo "python -u main.py"
-```
-
-### Manual Ubuntu install
+On Ubuntu/Debian, install Tk support before running the GUI:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 python3-pip python3-venv curl wget nano
+sudo apt install -y python3 python3-venv python3-pip python3-tk git
+```
 
+Optional text-to-speech support:
+
+```bash
+sudo apt install -y espeak-ng alsa-utils
+```
+
+## Install And Run
+
+```bash
 git clone https://github.com/ornab74/humoid-gui-gemma-4.git
 cd humoid-gui-gemma-4
 python3 -m venv venv
@@ -237,242 +236,64 @@ pip install -r requirements.txt
 python -u main.py
 ```
 
-### Termux + Ubuntu proot install
+If you are using Termux + Ubuntu proot, see:
 
-Use this when running through Termux.
-
-```bash
-#!/data/data/com.termux/files/usr/bin/bash
-set -e
-
-echo "Updating Termux packages..."
-pkg update -y && pkg upgrade -y
-pkg install -y bash bzip2 coreutils curl file findutils gawk gzip ncurses-utils proot sed tar util-linux xz-utils git wget
-
-echo "Removing any old proot-distro..."
-proot-distro remove ubuntu 2>/dev/null || true
-rm -rf $HOME/proot-distro 2>/dev/null
-
-echo "Cloning old working proot-distro commit..."
-cd $HOME
-git clone https://github.com/termux/proot-distro.git
-cd proot-distro
-git checkout ca53fee288be8f46ee0e4fc8ee23934023472054
-
-echo "Installing proot-distro from this commit..."
-chmod +x install.sh
-./install.sh
-
-echo "Installing Ubuntu rootfs..."
-proot-distro install ubuntu
-
-echo "Creating TMP dir..."
-export PROOT_TMP_DIR=$HOME/tmp
-mkdir -p $PROOT_TMP_DIR
-
-echo "Setting up sudouser + Python + Naza repo..."
-proot-distro login ubuntu -- <<'EOU'
-apt update && apt upgrade -y
-apt install -y sudo python3 python3-pip python3-venv git nano curl
-
-adduser --disabled-password --gecos "" sudouser
-usermod -aG sudo sudouser
-echo "sudouser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-
-su - sudouser -c "
-    mkdir -p ~/humoid-gui-gemma-4 && cd ~/humoid-gui-gemma-4
-    git clone https://github.com/ornab74/humoid-gui-gemma-4.git . || git pull
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install --upgrade pip
-    [ -f requirements.txt ] && pip install -r requirements.txt || true
-    chmod +x main.py
-"
-
-echo "Setup complete inside Ubuntu"
-EOU
+```text
+termux-naza-autosetup/termux-install.sh
+termux-naza-autosetup/ubuntu-install.sh
 ```
 
-### Termux auto-start banner
+## First Run Checklist
 
-```bash
-cat > ~/.bashrc <<'BASHRC'
-if [ -z "$NAZA_STARTED" ] && [ "$PWD" = "$HOME" ] && [ -z "$SSH_CLIENT" ] && [ -z "$TMUX" ]; then
-    export NAZA_STARTED=1
+1. Launch the app with `python -u main.py`.
+2. Create a vault password.
+3. Let the app guide you to `Download Model`.
+4. Download and encrypt the configured Gemma LiteRT-LM model.
+5. Open `Chat` and send a prompt.
+6. Use `History` or the Chat `History Index` drawer to reopen saved conversations.
 
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║          Starting SecureLLM TUI (humoid-gui-gemma-4/main.py)           ║"
-    echo "║        Ubuntu proot → /home/sudouser/humoid-gui-gemma-4                ║"
-    echo "╚══════════════════════════════════════════════════════════╝"
-    echo "   Type 'exit' twice to return to Termux"
-    echo ""
+## Model Configuration
 
-    proot-distro login ubuntu --user sudouser --shared-tmp -- bash -c "
-        cd /home/sudouser/humoid-gui-gemma-4 || exit 1
-        source venv/bin/activate || exit 1
-        export TERM=xterm-256color
-        export LANG=C.UTF-8
-        export PYTHONUNBUFFERED=1
-        clear
-        echo 'Starting main.py in venv...'
-        exec python -u main.py
-    "
+The default model settings live in `main.py`:
 
-    clear
-    echo "Returned to Termux."
-fi
-BASHRC
-
-echo "alias humoid='proot-distro login ubuntu --user sudouser -- bash -c \"cd ~/humoid-gui-gemma-4 && source venv/bin/activate && python -u main.py\"'" >> ~/.bashrc
+```python
+MODEL_REPO = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/"
+MODEL_FILE = "gemma-4-E2B-it.litertlm"
+EXPECTED_HASH = "ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42"
 ```
 
----
+If you change the model, update the filename and expected SHA256 together.
 
-## Running the app
+## GitHub Actions Lock Pipeline
 
-From the project root:
-
-```bash
-source venv/bin/activate
-python -u main.py
-```
-
-Expected menu areas:
-
-- Model Manager
-- Chat with model
-- Road Scanner
-- View chat history
-- Rekey / Rotate key
-
----
-
-## First run checklist
-
-1. Start the application.
-2. Create or derive an encryption key.
-3. Download the configured LiteRT-LM model.
-4. Verify SHA256.
-5. Encrypt the model.
-6. Run chat or road scanner.
-
----
-
-## GitHub Actions lock pipeline
-
-The repository can generate a locked dependency set from `requirements.in`.
-
-### Pipeline responsibilities
-
-- compile `requirements.txt` from `requirements.in`
-- include hashes in the generated lock file
-- record provenance metadata
-- create a canonical lock manifest
-- PQ-sign the manifest
-- verify the signature
-- upload the lock artifacts
-- optionally commit generated lock files back to the repository
-
-### Workflow diagram
+The workflow at `.github/workflows/lock-requirements.yml` builds a hash-locked `requirements.txt`, creates a canonical manifest, signs it with Dilithium2 through `liboqs-python`, verifies the signature, and uploads the lock artifacts.
 
 ```mermaid
 flowchart LR
-    A[requirements.in changed] --> B[GitHub Actions Workflow]
+    A[requirements.in changed] --> B[GitHub Actions]
     B --> C[Install pip-tools]
-    C --> D[pip-compile]
-    D --> E[Generate locked requirements.txt]
+    C --> D[pip-compile --generate-hashes]
+    D --> E[requirements.txt]
     E --> F[Add provenance header]
     F --> G[Create lock.manifest.json]
-    G --> H[PQ-sign manifest]
+    G --> H[PQ Sign with Dilithium2]
     H --> I[Verify signature]
-    I --> J[Upload artifacts]
-    I --> K[Commit lock files back to repo]
+    I --> J[Upload lock artifacts]
 ```
 
-### Architecture diagram
+Generated lock/signing artifacts:
 
-```mermaid
-flowchart TD
-    A[User in Terminal] --> B[main.py TUI]
-    B --> C[Key Management]
-    B --> D[Model Manager]
-    B --> E[Chat Session]
-    B --> F[Road Scanner]
-    B --> G[History Viewer]
-
-    C --> C1[Random AES Key]
-    C --> C2[PBKDF2 Derived Key]
-
-    D --> D1[Download .litertlm Model]
-    D1 --> D2[SHA256 Verify]
-    D2 --> D3[Encrypt Model to .aes]
-
-    E --> E1[Decrypt Encrypted Model]
-    E1 --> E2[LiteRT-LM Engine]
-    E2 --> E3[Conversation Response]
-    E3 --> E4[Log Encrypted History]
-    E4 --> E5[Re-encrypt Model]
-
-    F --> F1[Collect Scene Inputs]
-    F1 --> F2[Prompt Builder]
-    F2 --> E2
-    E2 --> F3[Low / Medium / High]
-
-    G --> G1[Decrypt SQLite DB]
-    G1 --> G2[Read / Search History]
-    G2 --> G3[Re-encrypt DB]
+```text
+requirements.txt
+lock.manifest.json
+lock.manifest.pqsig
+pq_pubkey.b64
 ```
 
-### Example runtime flow
+## Troubleshooting
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant T as TUI
-    participant K as Key Store
-    participant M as Encrypted Model
-    participant L as LiteRT-LM
-    participant D as Encrypted DB
-
-    U->>T: Start chat
-    T->>K: Load key
-    T->>M: Decrypt model
-    T->>L: Start engine + conversation
-    U->>L: Send prompt
-    L-->>T: Return response
-    T->>D: Log encrypted interaction
-    T->>M: Re-encrypt model
-    T-->>U: Display answer
-```
-
----
-
-## Dependency locking
-
-`requirements.in` is the source file used by the lock workflow.
-
-A GitHub Actions workflow can:
-
-- compile `requirements.txt`
-- add hashes
-- add a provenance header
-- generate a canonical manifest
-- sign the manifest
-- upload artifacts
-- commit lock outputs back into the repository
-
----
-
-## Configuration points
-
-Common values you may change in `main.py`:
-
-- `MODEL_REPO`
-- `MODEL_FILE`
-- `EXPECTED_HASH`
-- `MODELS_DIR`
-- `DB_PATH`
-- `KEY_PATH`
-
----
+- If the GUI does not launch, confirm `customtkinter` is installed and Python Tk support is available.
+- If model generation fails, use `Download Model -> Verify Hash` or re-download the model.
+- If native image input crashes, turn image mode off or disable experimental native image input in `Settings`.
+- If TTS fails, install `espeak-ng` and `alsa-utils`, or use the Python `pyttsx3` fallback.
+- If a generated file like `default.profraw` appears, it is LLVM profile data and is ignored by `*.profraw`.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
 import math
 import multiprocessing as mp
@@ -147,6 +148,7 @@ def sanitize_text(value: Any, *, max_chars: int = 20000) -> str:
     text = "" if value is None else str(value)
     if bleach is not None:
         text = bleach.clean(text, tags=[], attributes={}, protocols=[], strip=True)
+        text = html.unescape(text)
     text = CONTROL_CHARS_RE.sub("", text)
     if len(text) > max_chars:
         text = text[:max_chars] + "\n[truncated]"
@@ -171,17 +173,20 @@ def render_markdown_for_display(value: Any, *, max_chars: int = 20000) -> str:
             continue
 
         if in_code_block:
-            rendered.append("    " + raw_line)
+            rendered.append(raw_line)
             continue
 
         heading = re.match(r"^(#{1,6})\s+(.+)$", raw_line)
         if heading:
-            rendered.append(heading.group(2).strip().upper())
+            rendered.append(heading.group(2).strip())
             continue
 
-        line = MARKDOWN_LINK_RE.sub(r"\1 (\2)", raw_line)
+        line = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"[image: \1] (\2)", raw_line)
+        line = re.sub(r"^>\s?", "Quote: ", line)
+        line = MARKDOWN_LINK_RE.sub(r"\1 (\2)", line)
         line = re.sub(r"(\*\*|__)(.*?)\1", r"\2", line)
-        line = re.sub(r"(\*|_)(.*?)\1", r"\2", line)
+        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
+        line = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", line)
         line = re.sub(r"`([^`]+)`", r"\1", line)
         rendered.append(line)
 
@@ -1322,7 +1327,7 @@ class HumoidStudioApp(AppBase):
         self.change_new_password_var = tk.StringVar()
         self.change_confirm_password_var = tk.StringVar()
 
-        self.title("Humoid Gemma Studio")
+        self.title("Humoid Gemma 4")
         self.geometry("1420x940")
         self.minsize(1260, 860)
         self.configure(fg_color=PALETTE["window"])
@@ -1370,7 +1375,7 @@ class HumoidStudioApp(AppBase):
 
         ctk.CTkLabel(
             left,
-            text="A colorful local control room for your encrypted Gemma model, chat vault, and road scanner workflows.",
+            text="Human Androids",
             font=self.body_font,
             text_color=PALETTE["muted"],
             wraplength=720,
@@ -1875,7 +1880,7 @@ class HumoidStudioApp(AppBase):
         )
         ctk.CTkLabel(
             right,
-            text="Recent turns are tucked into each prompt so the chat feels conversational even though the model is reopened per request.",
+            text="Recent Messages",
             font=self.body_font,
             text_color=PALETTE["muted"],
             wraplength=320,
@@ -1896,6 +1901,7 @@ class HumoidStudioApp(AppBase):
         self.memory_preview.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 16))
         self.memory_preview.insert("1.0", "No turns yet.\n")
         self.memory_preview.configure(state="disabled")
+        self.configure_textbox_tags(self.memory_preview)
 
         tts_card = ctk.CTkFrame(right, fg_color=PALETTE["card_soft"], corner_radius=18, border_width=1, border_color=PALETTE["line"])
         tts_card.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
@@ -1928,8 +1934,8 @@ class HumoidStudioApp(AppBase):
         hint = ctk.CTkLabel(
             right,
             text=(
-                "Enter sends. Shift+Enter adds a new line. Image mode validates the file; "
-                "Gemma 4 uses the native LiteRT-LM vision path when native image input is enabled in Settings."
+                "Local TTS"
+                "Local AI"
             ),
             font=self.small_font,
             text_color=PALETTE["muted"],
@@ -1952,7 +1958,7 @@ class HumoidStudioApp(AppBase):
         )
         ctk.CTkLabel(
             left,
-            text="Download, verify, and seal the LiteRT-LM model without keeping loose plaintext around.",
+            text="Download, verify, and seal the model.",
             font=self.body_font,
             text_color=PALETTE["muted"],
             wraplength=520,
@@ -1995,7 +2001,7 @@ class HumoidStudioApp(AppBase):
         self.model_notes.insert(
             "1.0",
             "Safe defaults:\n"
-            "- Downloads land in a temporary file first.\n"
+            "- Downloads are placed into a temporary file first.\n"
             "- Hash mismatches are rejected automatically.\n"
             "- Encryption uses a streamed format so large model files do not have to live fully in memory.\n",
         )
@@ -2042,7 +2048,7 @@ class HumoidStudioApp(AppBase):
         )
         ctk.CTkLabel(
             form,
-            text="Fill in the scene details and let the local model classify the driving risk.",
+            text="Fill in your details to run the local model to classify driving risk.",
             font=self.body_font,
             text_color=PALETTE["muted"],
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 18))
@@ -2051,9 +2057,9 @@ class HumoidStudioApp(AppBase):
             ("location", "Location", "I-95 NB mile 12"),
             ("road_type", "Road Type", "highway"),
             ("weather", "Weather", "clear"),
-            ("traffic", "Traffic", "medium"),
+            ("traffic", "Traffic", "low"),
             ("obstacles", "Obstacles", "none"),
-            ("sensor_notes", "Sensor Notes", "camera and lidar stable"),
+            ("sensor_notes", "Sensor Notes", "notes about your vehicle sensors"),
         ]
         self.road_inputs: Dict[str, Any] = {}
         for row_index, (name, label, placeholder) in enumerate(fields, start=2):
@@ -2120,6 +2126,7 @@ class HumoidStudioApp(AppBase):
         self.road_detail_box.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 20))
         self.road_detail_box.insert("1.0", "Prompt and raw model output will appear here.\n")
         self.road_detail_box.configure(state="disabled")
+        self.configure_textbox_tags(self.road_detail_box)
 
     def build_history_tab(self) -> None:
         tab = self.history_tab
@@ -2168,6 +2175,7 @@ class HumoidStudioApp(AppBase):
         self.history_box.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.history_box.insert("1.0", "Unlock the vault, then refresh to browse encrypted history.\n")
         self.history_box.configure(state="disabled")
+        self.configure_textbox_tags(self.history_box)
 
     def build_settings_tab(self) -> None:
         tab = self.settings_tab
@@ -2223,8 +2231,8 @@ class HumoidStudioApp(AppBase):
         ctk.CTkLabel(
             look,
             text=(
-                "Gemma 4 LiteRT-LM is multimodal. If this is on, validated image prompts use the native "
-                "LiteRT-LM vision path with a CPU vision backend."
+                "Gemma 4 accepts both text and image input. If this is on, validated image prompts use the native "
+                "vision path with a CPU vision backend."
             ),
             font=self.small_font,
             text_color=PALETTE["muted"],
@@ -2272,6 +2280,13 @@ class HumoidStudioApp(AppBase):
             justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 16))
 
+        ctk.CTkLabel(
+            security,
+            text="Current password",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(anchor="w", padx=20, pady=(0, 6))
+
         self.current_password_entry = ctk.CTkEntry(
             security,
             textvariable=self.change_current_password_var,
@@ -2287,6 +2302,13 @@ class HumoidStudioApp(AppBase):
         self.current_password_entry.pack(fill="x", padx=20, pady=(0, 10))
         self.register_action(self.current_password_entry)
 
+        ctk.CTkLabel(
+            security,
+            text="New password",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(anchor="w", padx=20, pady=(0, 6))
+
         self.new_password_entry = ctk.CTkEntry(
             security,
             textvariable=self.change_new_password_var,
@@ -2301,6 +2323,13 @@ class HumoidStudioApp(AppBase):
         )
         self.new_password_entry.pack(fill="x", padx=20, pady=(0, 10))
         self.register_action(self.new_password_entry)
+
+        ctk.CTkLabel(
+            security,
+            text="Confirm new password",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(anchor="w", padx=20, pady=(0, 6))
 
         self.confirm_password_entry = ctk.CTkEntry(
             security,
@@ -2331,20 +2360,132 @@ class HumoidStudioApp(AppBase):
             text_widget.tag_config("user_header", foreground=PALETTE["accent_orange"], font=("DejaVu Sans", 11, "bold"))
             text_widget.tag_config("assistant_header", foreground=PALETTE["accent_teal"], font=("DejaVu Sans", 11, "bold"))
             text_widget.tag_config("meta", foreground=PALETTE["muted"], font=("DejaVu Sans", 10))
+            text_widget.tag_config("md_h1", foreground=PALETTE["accent_teal"], font=("DejaVu Sans Mono", 20, "bold"))
+            text_widget.tag_config("md_h2", foreground=PALETTE["accent_gold"], font=("DejaVu Sans Mono", 17, "bold"))
+            text_widget.tag_config("md_h3", foreground=PALETTE["accent_blue"], font=("DejaVu Sans Mono", 15, "bold"))
+            text_widget.tag_config("md_bold", foreground=PALETTE["text"], font=("DejaVu Sans", 14, "bold"))
+            text_widget.tag_config("md_italic", foreground=PALETTE["text"], font=("DejaVu Sans", 14, "italic"))
+            text_widget.tag_config("md_code_inline", foreground=PALETTE["accent_gold"], background="#142016", font=("DejaVu Sans Mono", 13))
+            text_widget.tag_config("md_code_block", foreground=PALETTE["accent_teal"], background="#08130c", font=("DejaVu Sans Mono", 13))
+            text_widget.tag_config("md_quote", foreground=PALETTE["accent_blue"], font=("DejaVu Sans", 14, "italic"))
+            text_widget.tag_config("md_quote_bar", foreground=PALETTE["accent_blue"], font=("DejaVu Sans Mono", 14, "bold"))
+            text_widget.tag_config("md_link", foreground=PALETTE["accent_blue"], underline=True)
+            text_widget.tag_config("md_list_marker", foreground=PALETTE["accent_teal"], font=("DejaVu Sans Mono", 14, "bold"))
+            text_widget.tag_config("md_hr", foreground=PALETTE["muted"], font=("DejaVu Sans Mono", 12))
         except Exception:
             return
+
+    def insert_markdown_text(self, textbox: ctk.CTkTextbox, value: Any, *, max_chars: int = 20000) -> None:
+        text = sanitize_text(value, max_chars=max_chars).replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        try:
+            text_widget = textbox._textbox
+        except Exception:
+            textbox.insert("end", render_markdown_for_display(text, max_chars=max_chars))
+            return
+
+        in_code_block = False
+        code_language = ""
+        for raw_line in text.split("\n"):
+            stripped = raw_line.strip()
+
+            fence = re.match(r"^```([\w.+-]*)\s*$", stripped)
+            if fence:
+                if in_code_block:
+                    text_widget.insert("end", "\n", ("md_code_block",))
+                    in_code_block = False
+                    code_language = ""
+                else:
+                    code_language = fence.group(1).strip()
+                    label = f" code: {code_language} " if code_language else " code "
+                    text_widget.insert("end", label + "\n", ("meta",))
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                text_widget.insert("end", raw_line + "\n", ("md_code_block",))
+                continue
+
+            if re.fullmatch(r"\s*([-*_])(?:\s*\1){2,}\s*", raw_line):
+                text_widget.insert("end", "─" * 72 + "\n", ("md_hr",))
+                continue
+
+            heading = re.match(r"^(#{1,6})\s+(.+)$", raw_line)
+            if heading:
+                level = min(len(heading.group(1)), 3)
+                text_widget.insert("end", heading.group(2).strip() + "\n", (f"md_h{level}",))
+                continue
+
+            quote = re.match(r"^\s*>\s?(.*)$", raw_line)
+            if quote:
+                text_widget.insert("end", "┃ ", ("md_quote_bar",))
+                self.insert_markdown_inline(text_widget, quote.group(1), default_tag="md_quote")
+                text_widget.insert("end", "\n")
+                continue
+
+            unordered = re.match(r"^(\s*)([-+*])\s+(.+)$", raw_line)
+            if unordered:
+                text_widget.insert("end", unordered.group(1) + "• ", ("md_list_marker",))
+                self.insert_markdown_inline(text_widget, unordered.group(3))
+                text_widget.insert("end", "\n")
+                continue
+
+            ordered = re.match(r"^(\s*)(\d+)\.\s+(.+)$", raw_line)
+            if ordered:
+                text_widget.insert("end", f"{ordered.group(1)}{ordered.group(2)}. ", ("md_list_marker",))
+                self.insert_markdown_inline(text_widget, ordered.group(3))
+                text_widget.insert("end", "\n")
+                continue
+
+            self.insert_markdown_inline(text_widget, raw_line)
+            text_widget.insert("end", "\n")
+
+        if in_code_block:
+            text_widget.insert("end", "\n", ("md_code_block",))
+
+    def insert_markdown_inline(self, text_widget: Any, line: str, default_tag: Optional[str] = None) -> None:
+        token_re = re.compile(
+            r"(!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|(?<!\*)\*[^*\n]+?\*(?!\*)|(?<!_)_[^_\n]+?_(?!_))"
+        )
+        pos = 0
+        for match in token_re.finditer(line):
+            if match.start() > pos:
+                text_widget.insert("end", line[pos : match.start()], (default_tag,) if default_tag else ())
+            token = match.group(0)
+            image = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", token)
+            link = re.match(r"\[([^\]]+)\]\(([^)]+)\)", token)
+            if image:
+                alt, url = image.groups()
+                text_widget.insert("end", f"[image: {alt or 'untitled'}]", ("md_link",))
+                text_widget.insert("end", f" ({url})", ("meta",))
+            elif link:
+                label, url = link.groups()
+                text_widget.insert("end", label, ("md_link",))
+                text_widget.insert("end", f" ({url})", ("meta",))
+            elif token.startswith("`") and token.endswith("`"):
+                text_widget.insert("end", token[1:-1], ("md_code_inline",))
+            elif token.startswith(("**", "__")) and token.endswith(("**", "__")):
+                text_widget.insert("end", token[2:-2], ("md_bold",))
+            elif token.startswith(("*", "_")) and token.endswith(("*", "_")):
+                text_widget.insert("end", token[1:-1], ("md_italic",))
+            else:
+                text_widget.insert("end", token, (default_tag,) if default_tag else ())
+            pos = match.end()
+
+        if pos < len(line):
+            text_widget.insert("end", line[pos:], (default_tag,) if default_tag else ())
 
     def append_chat_message(self, role: str, message: str) -> None:
         self.chat_output.configure(state="normal")
         tag = "user_header" if role == "You" else "assistant_header"
         timestamp = time.strftime("%H:%M:%S")
-        safe_message = render_markdown_for_display(message)
         try:
             text_widget = self.chat_output._textbox
             text_widget.insert("end", f"{role}  {timestamp}\n", (tag,))
-            text_widget.insert("end", safe_message.strip() + "\n\n")
+            self.insert_markdown_text(self.chat_output, message)
+            text_widget.insert("end", "\n")
             text_widget.see("end")
         except Exception:
+            safe_message = render_markdown_for_display(message)
             self.chat_output.insert("end", f"{role}  {timestamp}\n{safe_message.strip()}\n\n")
         self.chat_output.configure(state="disabled")
 
@@ -2356,7 +2497,9 @@ class HumoidStudioApp(AppBase):
         else:
             for role, message in self.chat_memory[-12:]:
                 label = "You" if role == "user" else "Gemma"
-                self.memory_preview.insert("end", f"{label}: {render_markdown_for_display(message, max_chars=5000)}\n\n")
+                self.memory_preview.insert("end", f"{label}: ", ("meta",))
+                self.insert_markdown_text(self.memory_preview, message, max_chars=5000)
+                self.memory_preview.insert("end", "\n")
         self.memory_preview.configure(state="disabled")
 
     def refresh_dashboard(self) -> None:
@@ -2647,12 +2790,11 @@ class HumoidStudioApp(AppBase):
             self.road_result_label.configure(text=label, text_color=color)
             self.road_detail_box.configure(state="normal")
             self.road_detail_box.delete("1.0", "end")
-            self.road_detail_box.insert(
-                "1.0",
-                f"Timestamp: {sanitize_text(result['timestamp'], max_chars=80)}\n\n"
-                f"Prompt:\n{render_markdown_for_display(result['prompt'], max_chars=8000)}\n\n"
-                f"Raw model output:\n{render_markdown_for_display(result['raw'], max_chars=4000)}\n",
-            )
+            self.road_detail_box.insert("1.0", f"Timestamp: {sanitize_text(result['timestamp'], max_chars=80)}\n\n", ("meta",))
+            self.road_detail_box.insert("end", "Prompt:\n", ("assistant_header",))
+            self.insert_markdown_text(self.road_detail_box, result["prompt"], max_chars=8000)
+            self.road_detail_box.insert("end", "\nRaw model output:\n", ("assistant_header",))
+            self.insert_markdown_text(self.road_detail_box, result["raw"], max_chars=4000)
             self.road_detail_box.configure(state="disabled")
             self.road_export_button.configure(state="normal")
             self.status_var.set("Road scan complete. The result has been logged into the encrypted history vault.")
@@ -2745,13 +2887,12 @@ class HumoidStudioApp(AppBase):
             self.history_box.insert("end", "No history rows for this page.\n")
         else:
             for row_id, stamp, prompt, response in rows:
-                self.history_box.insert(
-                    "end",
-                    f"[{row_id}] {sanitize_text(stamp, max_chars=80)}\n"
-                    f"Prompt:\n{render_markdown_for_display(prompt, max_chars=8000)}\n\n"
-                    f"Response:\n{render_markdown_for_display(response, max_chars=12000)}\n\n"
-                    f"{'-' * 72}\n\n",
-                )
+                self.history_box.insert("end", f"[{row_id}] {sanitize_text(stamp, max_chars=80)}\n", ("meta",))
+                self.history_box.insert("end", "Prompt:\n", ("user_header",))
+                self.insert_markdown_text(self.history_box, prompt, max_chars=8000)
+                self.history_box.insert("end", "\nResponse:\n", ("assistant_header",))
+                self.insert_markdown_text(self.history_box, response, max_chars=12000)
+                self.history_box.insert("end", "\n" + ("─" * 72) + "\n\n", ("md_hr",))
         self.history_box.configure(state="disabled")
         self.status_var.set("Encrypted history loaded.")
 

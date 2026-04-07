@@ -93,6 +93,9 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 HISTORY_PAGE_SIZE = 12
 CHAT_TOOLBAR_STATE_KEY = "chat_toolbar_visible"
+DYNAMIC_SUPPORT_RAG_HISTORY_KEY = "dynamic_support_rag_history"
+DASHBOARD_QUANTUM_COLOR_STATE_KEY = "dashboard_quantum_color_state"
+DASHBOARD_QUANTUM_COLOR_TRAIL_KEY = "dashboard_quantum_color_trail"
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 LATEX_COMMAND_REPLACEMENTS = {
@@ -225,6 +228,7 @@ CHAT_STYLE_OPTIONS = ["Balanced", "Code", "Teacher", "Creative", "Research"]
 CHAT_DEPTH_OPTIONS = ["Brief", "Normal", "Deep"]
 INFERENCE_BACKEND_OPTIONS = ["Auto", "CPU", "GPU"]
 INFERENCE_AUTO_SELECTED_OPTIONS = ["", "CPU", "GPU"]
+DYNAMIC_SUPPORT_RAG_MODE_OPTIONS = ["Gentle", "Builder", "Inventive"]
 CHAT_STYLE_GUIDES = {
     "Balanced": "Be warm, useful, and direct. Match the user's energy without overexplaining.",
     "Code": "Prioritize correct runnable code, compact explanations, edge cases, and safe local assumptions.",
@@ -237,9 +241,56 @@ CHAT_DEPTH_GUIDES = {
     "Normal": "Give enough context to be helpful without flooding the user.",
     "Deep": "Provide thorough reasoning, tradeoffs, and examples when useful.",
 }
+DYNAMIC_SUPPORT_RAG_MODE_GUIDES = {
+    "Gentle": "Use calm, low-pressure encouragement and avoid hype.",
+    "Builder": "Use practical momentum, concrete next steps, and steady confidence.",
+    "Inventive": "Use more varied imagery and creative language while staying grounded.",
+}
+DYNAMIC_RAG_SURFACES = [
+    ("Greenhouse Lattice", "grow the useful part of the user's idea with patient warmth"),
+    ("Kintsugi Workshop", "repair confusion into a stronger next action without shame"),
+    ("Lantern Index", "light the nearest safe step before expanding into options"),
+    ("Circuit Garden", "blend technical precision with living, non-repetitive encouragement"),
+    ("Tidepool Compass", "slow the pace, observe the real constraints, then move cleanly"),
+    ("Hearth Cache", "make the reply feel steady, private, and human-safe"),
+    ("Orbit Map", "keep the big idea visible while giving one reachable maneuver"),
+    ("Signal Grove", "amplify progress signals and dampen spirals or self-defeating language"),
+]
+DYNAMIC_RAG_MOVES = [
+    "Name a concrete sign of progress before critique.",
+    "Turn uncertainty into a bounded experiment instead of a failure story.",
+    "Prefer specific encouragement over generic praise.",
+    "Use one fresh metaphor at most; usefulness beats decoration.",
+    "If the task is technical, pair encouragement with a runnable next step.",
+    "When the user sounds overloaded, reduce branching and offer a calm path.",
+    "Do not repeat the same praise phrase across turns.",
+    "Avoid negative self-talk about the assistant or the user; focus on repair and momentum.",
+]
+DYNAMIC_RAG_WONDER_LENSES = [
+    ("Chalk Dust Telescope", "make the explanation small enough to test and wide enough to matter"),
+    ("Kitchen-Table Cosmos", "translate abstractions into everyday structure without dumbing them down"),
+    ("Curiosity Engine", "ask what would change the answer before sounding certain"),
+    ("Blackboard Star Map", "split the idea into variables, forces, and observable consequences"),
+    ("Small Experiment Door", "look for one quick local test, simulation, or sanity check"),
+    ("Humility Horizon", "mark the boundary between evidence, model guess, and unknowns"),
+    ("Particle Garden", "show how simple rules can combine into surprising behavior"),
+    ("Night-Sky Debugger", "zoom out from noise, then return to the next concrete action"),
+]
+DYNAMIC_RAG_EXPERIMENT_MOVES = [
+    "Explain the core idea in plain language before specialized vocabulary.",
+    "Offer a tiny falsifiable test or measurement when it fits the task.",
+    "Separate mechanism, evidence, and metaphor so wonder stays precise.",
+    "Use a miniature example before the general rule.",
+    "Name one assumption that would change the answer.",
+    "Prefer curiosity over certainty when data is missing.",
+    "Show the lever that matters most before listing every lever.",
+    "Keep awe grounded in practical next steps.",
+]
 
 DEFAULT_SETTINGS = {
     "include_system_entropy": True,
+    "enable_dynamic_support_rag": True,
+    "dynamic_support_rag_mode": "Builder",
     "delete_plaintext_after_encrypt": True,
     "chat_memory_turns": 6,
     "chat_font_size": 13,
@@ -927,6 +978,233 @@ def save_app_state_bool(key: bytes, name: str, value: bool) -> None:
     save_app_state_value(key, name, "1" if value else "0")
 
 
+def load_dynamic_support_rag_history(key: bytes) -> List[str]:
+    raw_value = fetch_app_state_value(key, DYNAMIC_SUPPORT_RAG_HISTORY_KEY, default="[]")
+    try:
+        values = json.loads(raw_value)
+    except Exception:
+        return []
+    if not isinstance(values, list):
+        return []
+
+    history: List[str] = []
+    for value in values:
+        clean_value = sanitize_text(value, max_chars=80).strip()
+        if clean_value and clean_value not in history:
+            history.append(clean_value)
+    return history[:8]
+
+
+def save_dynamic_support_rag_history(key: bytes, history: List[str]) -> None:
+    clean_history: List[str] = []
+    for value in history:
+        clean_value = sanitize_text(value, max_chars=80).strip()
+        if clean_value and clean_value not in clean_history:
+            clean_history.append(clean_value)
+    save_app_state_value(key, DYNAMIC_SUPPORT_RAG_HISTORY_KEY, json.dumps(clean_history[:8]))
+
+
+def normalize_dashboard_quantum_color_state(state: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not isinstance(state, dict):
+        return {}
+
+    color = sanitize_text(state.get("color", ""), max_chars=16).strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        color = ""
+
+    return {
+        "qid": sanitize_text(state.get("qid", ""), max_chars=32).strip(),
+        "color": color.lower(),
+        "mood": sanitize_text(state.get("mood", ""), max_chars=240).strip(),
+        "rgb": sanitize_text(state.get("rgb", ""), max_chars=80).strip(),
+        "backend": sanitize_text(state.get("backend", ""), max_chars=80).strip(),
+        "source": sanitize_text(state.get("source", ""), max_chars=80).strip(),
+        "updated_at": sanitize_text(state.get("updated_at", ""), max_chars=80).strip(),
+    }
+
+
+def load_dashboard_quantum_color_state(key: bytes) -> Dict[str, str]:
+    raw_value = fetch_app_state_value(key, DASHBOARD_QUANTUM_COLOR_STATE_KEY, default="{}")
+    try:
+        state = json.loads(raw_value)
+    except Exception:
+        return {}
+    clean_state = normalize_dashboard_quantum_color_state(state)
+    if not clean_state.get("qid") and not clean_state.get("color") and not clean_state.get("mood"):
+        return {}
+    return clean_state
+
+
+def load_dashboard_quantum_color_trail(key: bytes) -> List[Dict[str, str]]:
+    raw_value = fetch_app_state_value(key, DASHBOARD_QUANTUM_COLOR_TRAIL_KEY, default="[]")
+    try:
+        values = json.loads(raw_value)
+    except Exception:
+        return []
+    if not isinstance(values, list):
+        return []
+
+    trail: List[Dict[str, str]] = []
+    for value in values:
+        clean_state = normalize_dashboard_quantum_color_state(value)
+        if clean_state.get("qid") or clean_state.get("color") or clean_state.get("mood"):
+            trail.append(clean_state)
+    return trail[:6]
+
+
+def save_dashboard_quantum_color_trail(key: bytes, trail: List[Dict[str, str]]) -> None:
+    clean_trail: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for value in trail:
+        clean_state = normalize_dashboard_quantum_color_state(value)
+        if not (clean_state.get("qid") or clean_state.get("color") or clean_state.get("mood")):
+            continue
+        signature = "|".join(
+            [
+                clean_state.get("qid", ""),
+                clean_state.get("color", ""),
+                clean_state.get("mood", "")[:120],
+                clean_state.get("updated_at", ""),
+            ]
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        clean_trail.append(clean_state)
+    save_app_state_value(key, DASHBOARD_QUANTUM_COLOR_TRAIL_KEY, json.dumps(clean_trail[:6], sort_keys=True))
+
+
+def append_dashboard_quantum_color_trail(key: bytes, state: Dict[str, Any]) -> None:
+    clean_state = normalize_dashboard_quantum_color_state(
+        {
+            **state,
+            "updated_at": state.get("updated_at") or time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    if not (clean_state.get("qid") or clean_state.get("color") or clean_state.get("mood")):
+        return
+
+    existing_trail = load_dashboard_quantum_color_trail(key)
+    if existing_trail:
+        latest = existing_trail[0]
+        same_live_state = (
+            latest.get("qid") == clean_state.get("qid")
+            and latest.get("color") == clean_state.get("color")
+            and latest.get("mood") == clean_state.get("mood")
+        )
+        if same_live_state:
+            existing_trail = existing_trail[1:]
+    save_dashboard_quantum_color_trail(key, [clean_state, *existing_trail])
+
+
+def save_dashboard_quantum_color_state(key: bytes, state: Dict[str, Any]) -> None:
+    clean_state = normalize_dashboard_quantum_color_state(
+        {
+            **state,
+            "updated_at": state.get("updated_at") or time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    save_app_state_value(key, DASHBOARD_QUANTUM_COLOR_STATE_KEY, json.dumps(clean_state, sort_keys=True))
+    append_dashboard_quantum_color_trail(key, clean_state)
+
+
+def rgb_tuple_from_hex(color: str) -> Optional[Tuple[int, int, int]]:
+    clean_color = sanitize_text(color, max_chars=16).strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", clean_color):
+        return None
+    return int(clean_color[1:3], 16), int(clean_color[3:5], 16), int(clean_color[5:7], 16)
+
+
+def normalized_color_distance(color_a: str, color_b: str) -> float:
+    rgb_a = rgb_tuple_from_hex(color_a)
+    rgb_b = rgb_tuple_from_hex(color_b)
+    if rgb_a is None or rgb_b is None:
+        return 0.0
+    distance = math.sqrt(sum((left - right) ** 2 for left, right in zip(rgb_a, rgb_b)))
+    return max(0.0, min(1.0, distance / math.sqrt(3 * (255**2))))
+
+
+def dashboard_quantum_color_trail_summary(trail: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
+    clean_trail = [normalize_dashboard_quantum_color_state(item) for item in trail or []]
+    clean_trail = [item for item in clean_trail if item.get("qid") or item.get("color") or item.get("mood")]
+    if not clean_trail:
+        return {"count": "0", "motion": "none", "drift": "0.00", "palette": ""}
+
+    drift_values: List[float] = []
+    for current, previous in zip(clean_trail, clean_trail[1:]):
+        drift_values.append(normalized_color_distance(current.get("color", ""), previous.get("color", "")))
+    avg_drift = sum(drift_values) / len(drift_values) if drift_values else 0.0
+    if avg_drift >= 0.35:
+        motion = "surging"
+    elif avg_drift >= 0.16:
+        motion = "shifting"
+    elif len(clean_trail) > 1:
+        motion = "stable"
+    else:
+        motion = "single-sample"
+
+    palette = " -> ".join(item.get("color", "") or "unknown" for item in clean_trail[:4])
+    return {
+        "count": str(len(clean_trail)),
+        "motion": motion,
+        "drift": f"{avg_drift:.2f}",
+        "palette": palette,
+    }
+
+
+def dashboard_quantum_color_signature(state: Optional[Dict[str, str]]) -> str:
+    clean_state = normalize_dashboard_quantum_color_state(state)
+    if not clean_state.get("qid") and not clean_state.get("color") and not clean_state.get("mood"):
+        return "dashboard_quantum_color=none"
+    return "|".join(
+        [
+            f"dashboard_qid={clean_state.get('qid', '')}",
+            f"dashboard_color={clean_state.get('color', '')}",
+            f"dashboard_mood={clean_state.get('mood', '')[:120]}",
+        ]
+    )
+
+
+def dashboard_quantum_color_trail_signature(trail: Optional[List[Dict[str, str]]]) -> str:
+    summary = dashboard_quantum_color_trail_summary(trail)
+    if summary["count"] == "0":
+        return "dashboard_quantum_color_trail=none"
+    return "|".join(
+        [
+            f"dashboard_trail_count={summary['count']}",
+            f"dashboard_trail_motion={summary['motion']}",
+            f"dashboard_trail_drift={summary['drift']}",
+            f"dashboard_trail_palette={summary['palette']}",
+        ]
+    )
+
+
+def dashboard_quantum_color_context_line(state: Optional[Dict[str, str]]) -> str:
+    clean_state = normalize_dashboard_quantum_color_state(state)
+    if not clean_state.get("qid") and not clean_state.get("color") and not clean_state.get("mood"):
+        return "dashboard_quantum_color: none stored yet; choose the wonder lens from live local entropy only."
+
+    return (
+        "dashboard_quantum_color: "
+        f"qid={clean_state.get('qid', '') or 'unknown'}, "
+        f"color={clean_state.get('color', '') or 'unknown'}, "
+        f"mood={clean_state.get('mood', '') or 'unknown'}, "
+        f"updated_at={clean_state.get('updated_at', '') or 'unknown'}; "
+        "use this as a private local tone signal, not as evidence about the user's emotions."
+    )
+
+
+def dashboard_quantum_color_trail_context_line(trail: Optional[List[Dict[str, str]]]) -> str:
+    summary = dashboard_quantum_color_trail_summary(trail)
+    if summary["count"] == "0":
+        return "dashboard_quantum_color_trail: no encrypted trail stored yet."
+    return (
+        "dashboard_quantum_color_trail: "
+        f"samples={summary['count']}, motion={summary['motion']}, drift={summary['drift']}, "
+        f"palette={summary['palette']}; use this only to vary wonder-lens selection and pacing."
+    )
+
+
 def fetch_history_page(
     key: bytes,
     *,
@@ -1301,6 +1579,244 @@ def entropic_summary_text(score: float) -> str:
     return f"entropic_score={score:.3f} (level={level})"
 
 
+def metric_band(value: float, *, low: float = 0.35, high: float = 0.7) -> str:
+    if value >= high:
+        return "high"
+    if value >= low:
+        return "medium"
+    return "low"
+
+
+def choose_digest_item(items: List[Any], digest: bytes, offset: int) -> Any:
+    if not items:
+        return ""
+    return items[digest[offset % len(digest)] % len(items)]
+
+
+def choose_distinct_digest_items(items: List[Any], digest: bytes, offset: int, count: int) -> List[Any]:
+    selected: List[Any] = []
+    for index in range(len(digest)):
+        item = choose_digest_item(items, digest, offset + index)
+        if item and item not in selected:
+            selected.append(item)
+        if len(selected) >= count:
+            return selected
+    for item in items:
+        if item and item not in selected:
+            selected.append(item)
+        if len(selected) >= count:
+            break
+    return selected
+
+
+def dynamic_support_rag_status_line(
+    mode: str = "Builder",
+    dashboard_state: Optional[Dict[str, str]] = None,
+    dashboard_trail: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    clean_mode = normalize_setting_choice(mode, DYNAMIC_SUPPORT_RAG_MODE_OPTIONS, "Builder")
+    try:
+        metrics = collect_system_metrics()
+        rgb = metrics_to_rgb(metrics)
+        score = pennylane_entropic_score(rgb, shots=64)
+        surface_name, _surface_rule = dynamic_support_rag_surface(
+            metrics,
+            score,
+            clean_mode,
+            dashboard_state=dashboard_state,
+            dashboard_trail=dashboard_trail,
+        )
+        digest = hashlib.sha256(
+            dynamic_support_rag_signature(metrics, score, clean_mode, dashboard_state, dashboard_trail).encode("utf-8")
+        ).digest()
+        wonder_lens = choose_distinct_digest_items(DYNAMIC_RAG_WONDER_LENSES, digest, 11, 1)
+        lens_name = wonder_lens[0][0] if wonder_lens else "Wonder Lens"
+        color = normalize_dashboard_quantum_color_state(dashboard_state).get("color", "")
+        color_note = f" color={color}" if color else ""
+        trail_summary = dashboard_quantum_color_trail_summary(dashboard_trail)
+        trail_note = "" if trail_summary["count"] == "0" else f" trail={trail_summary['motion']}/{trail_summary['drift']}"
+        return (
+            f"{surface_name} + {lens_name} | cpu={metrics.get('cpu', 0.0):.2f} "
+            f"mem={metrics.get('mem', 0.0):.2f} load={metrics.get('load1', 0.0):.2f} "
+            f"q={score:.2f}{color_note}{trail_note}"
+        )
+    except Exception as exc:
+        return f"Local entropy unavailable: {sanitize_text(exc, max_chars=90)}"
+
+
+def dynamic_support_rag_signature(
+    metrics: Dict[str, float],
+    score: float,
+    mode: str,
+    dashboard_state: Optional[Dict[str, str]] = None,
+    dashboard_trail: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    return "|".join(
+        [
+            f"{metrics.get('cpu', 0.0):.3f}",
+            f"{metrics.get('mem', 0.0):.3f}",
+            f"{metrics.get('load1', 0.0):.3f}",
+            f"{metrics.get('temp', 0.0):.3f}",
+            f"{score:.3f}",
+            normalize_setting_choice(mode, DYNAMIC_SUPPORT_RAG_MODE_OPTIONS, "Builder"),
+            dashboard_quantum_color_signature(dashboard_state),
+            dashboard_quantum_color_trail_signature(dashboard_trail),
+        ]
+    )
+
+
+def select_dynamic_support_rag_surface(
+    metrics: Dict[str, float],
+    score: float,
+    mode: str,
+    recent_surfaces: Optional[List[str]] = None,
+    dashboard_state: Optional[Dict[str, str]] = None,
+    dashboard_trail: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, str]:
+    digest = hashlib.sha256(dynamic_support_rag_signature(metrics, score, mode, dashboard_state, dashboard_trail).encode("utf-8")).digest()
+    recent_names = {sanitize_text(name, max_chars=80).strip() for name in recent_surfaces or []}
+    candidates: List[Tuple[str, str]] = []
+    for offset in range(len(digest)):
+        candidate = choose_digest_item(DYNAMIC_RAG_SURFACES, digest, offset)
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in DYNAMIC_RAG_SURFACES:
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if candidate[0] not in recent_names:
+            return candidate
+    return candidates[0] if candidates else ("Dynamic Support Field", "stay useful, specific, and kind")
+
+
+def choose_dynamic_rag_moves(digest: bytes) -> Tuple[str, str]:
+    moves = choose_distinct_digest_items(DYNAMIC_RAG_MOVES, digest, 2, 2)
+    move_a = moves[0] if moves else "Name a concrete sign of progress before critique."
+    move_b = moves[1] if len(moves) > 1 else "Turn uncertainty into a bounded experiment instead of a failure story."
+    return move_a, move_b
+
+
+def choose_dynamic_rag_wonder_lens(digest: bytes) -> Tuple[str, str]:
+    lenses = choose_distinct_digest_items(DYNAMIC_RAG_WONDER_LENSES, digest, 11, 1)
+    return lenses[0] if lenses else ("Wonder Lens", "make the answer clear, testable, and humbly curious")
+
+
+def choose_dynamic_rag_experiment_move(digest: bytes) -> str:
+    moves = choose_distinct_digest_items(DYNAMIC_RAG_EXPERIMENT_MOVES, digest, 19, 1)
+    return moves[0] if moves else "Use a miniature example before the general rule."
+
+
+def dynamic_support_rag_surface(
+    metrics: Dict[str, float],
+    score: float,
+    mode: str,
+    dashboard_state: Optional[Dict[str, str]] = None,
+    dashboard_trail: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, str]:
+    return select_dynamic_support_rag_surface(metrics, score, mode, dashboard_state=dashboard_state, dashboard_trail=dashboard_trail)
+
+
+def build_dynamic_support_rag_packet(
+    mode: str = "Builder",
+    recent_surfaces: Optional[List[str]] = None,
+    dashboard_state: Optional[Dict[str, str]] = None,
+    dashboard_trail: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, str]:
+    clean_mode = normalize_setting_choice(mode, DYNAMIC_SUPPORT_RAG_MODE_OPTIONS, "Builder")
+    try:
+        metrics = collect_system_metrics()
+        rgb = metrics_to_rgb(metrics)
+        score = pennylane_entropic_score(rgb, shots=128)
+    except Exception as exc:
+        fallback_context = (
+            "Dynamic Support RAG is enabled, but local entropy is unavailable. "
+            f"Fallback reason: {sanitize_text(exc, max_chars=140)}. "
+            "Use calm, task-specific encouragement without pretending to read external data. "
+            + dashboard_quantum_color_context_line(dashboard_state)
+            + " "
+            + dashboard_quantum_color_trail_context_line(dashboard_trail)
+        )
+        return {
+            "context": fallback_context,
+            "surface": "",
+            "move_a": "",
+            "move_b": "",
+            "wonder_lens": "",
+            "wonder_move": "",
+            "signature": "",
+        }
+
+    signature = dynamic_support_rag_signature(metrics, score, clean_mode, dashboard_state, dashboard_trail)
+    digest = hashlib.sha256(signature.encode("utf-8")).digest()
+    surface_name, surface_rule = select_dynamic_support_rag_surface(
+        metrics,
+        score,
+        clean_mode,
+        recent_surfaces,
+        dashboard_state,
+        dashboard_trail,
+    )
+    move_a, move_b = choose_dynamic_rag_moves(digest)
+    wonder_lens_name, wonder_lens_rule = choose_dynamic_rag_wonder_lens(digest)
+    wonder_move = choose_dynamic_rag_experiment_move(digest)
+    mode_rule = DYNAMIC_SUPPORT_RAG_MODE_GUIDES.get(clean_mode, DYNAMIC_SUPPORT_RAG_MODE_GUIDES["Builder"])
+    cpu_band = metric_band(metrics.get("cpu", 0.0))
+    mem_band = metric_band(metrics.get("mem", 0.0))
+    load_band = metric_band(metrics.get("load1", 0.0))
+    entropy_band = metric_band(score, low=0.45, high=0.75)
+
+    pressure_rule = "Use compact structure and reduce flourish." if load_band == "high" or mem_band == "high" else "Allow a little warmth, then return to the task."
+    if cpu_band == "high":
+        pressure_rule = "Keep the reply stable, concise, and easy to act on."
+    if entropy_band == "high" and clean_mode == "Inventive":
+        pressure_rule = "Vary the encouragement surface, but keep instructions practical."
+
+    recent_clean = [sanitize_text(name, max_chars=80).strip() for name in recent_surfaces or []]
+    recent_clean = [name for name in recent_clean if name]
+    rotation_line = (
+        "rotation_memory: no recent surfaces stored yet; start a fresh support pattern."
+        if not recent_clean
+        else "rotation_memory: recent_surfaces="
+        + ", ".join(recent_clean[:4])
+        + "; avoid echoing those patterns unless the user explicitly asks."
+    )
+
+    context = "\n".join(
+        [
+            "<dynamic_support_rag>",
+            "source: local psutil CPU/RAM/load/temperature plus PennyLane quantum entropy or deterministic fallback; no network, weather, or browsing.",
+            f"entropy_signature: cpu={metrics.get('cpu', 0.0):.2f}, mem={metrics.get('mem', 0.0):.2f}, load={metrics.get('load1', 0.0):.2f}, temp={metrics.get('temp', 0.0):.2f}, q={score:.2f}",
+            dashboard_quantum_color_context_line(dashboard_state),
+            dashboard_quantum_color_trail_context_line(dashboard_trail),
+            f"mode: {clean_mode} | {mode_rule}",
+            f"surface: {surface_name} - {surface_rule}.",
+            f"retrieved_move_1: {move_a}",
+            f"retrieved_move_2: {move_b}",
+            f"wonder_lens: {wonder_lens_name} - {wonder_lens_rule}.",
+            f"wonder_move: {wonder_move}",
+            rotation_line,
+            f"load_policy: {pressure_rule}",
+            "safety_policy: This is a supportive output scaffold, not therapy, diagnosis, crisis response, or medical advice.",
+            "wonder_policy: Use first-principles clarity, grounded awe, small examples, and clear uncertainty labels when they help; do not imitate or quote public figures, and do not force cosmic language into ordinary tasks.",
+            "generation_policy: Encourage sustainably, avoid repetitive praise loops, do not spiral into negative self-characterization, and always obey the user's actual task and requested format.",
+            "</dynamic_support_rag>",
+        ]
+    )
+    return {
+        "context": context,
+        "surface": surface_name,
+        "move_a": move_a,
+        "move_b": move_b,
+        "wonder_lens": wonder_lens_name,
+        "wonder_move": wonder_move,
+        "signature": signature,
+    }
+
+
+def build_dynamic_support_rag_context(mode: str = "Builder") -> str:
+    return build_dynamic_support_rag_packet(mode)["context"]
+
+
 def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -> Tuple[str, str]:
     entropy_text = "entropic_score=unknown"
     if include_system_entropy:
@@ -1370,6 +1886,9 @@ def load_settings() -> Dict[str, Any]:
     settings.update({k: raw.get(k, v) for k, v in DEFAULT_SETTINGS.items()})
     if "enable_native_image_input" not in raw and configured_model_supports_native_image_input():
         settings["enable_native_image_input"] = True
+    settings["dynamic_support_rag_mode"] = normalize_setting_choice(
+        settings.get("dynamic_support_rag_mode"), DYNAMIC_SUPPORT_RAG_MODE_OPTIONS, "Builder"
+    )
     settings["inference_backend"] = normalize_setting_choice(
         settings.get("inference_backend"), INFERENCE_BACKEND_OPTIONS, "Auto"
     )
@@ -1437,6 +1956,9 @@ def build_chat_system_prompt(
     chat_style: str = "Balanced",
     response_depth: str = "Normal",
     strict_prompt_formatting: bool = True,
+    enable_dynamic_support_rag: bool = False,
+    dynamic_support_rag_mode: str = "Builder",
+    dynamic_support_rag_context: Optional[str] = None,
 ) -> str:
     style = normalize_setting_choice(chat_style, CHAT_STYLE_OPTIONS, "Balanced")
     depth = normalize_setting_choice(response_depth, CHAT_DEPTH_OPTIONS, "Normal")
@@ -1449,6 +1971,10 @@ def build_chat_system_prompt(
         CHAT_STYLE_GUIDES.get(style, CHAT_STYLE_GUIDES["Balanced"]),
         CHAT_DEPTH_GUIDES.get(depth, CHAT_DEPTH_GUIDES["Normal"]),
     ]
+    if dynamic_support_rag_context:
+        lines.append(dynamic_support_rag_context)
+    elif enable_dynamic_support_rag:
+        lines.append(build_dynamic_support_rag_context(dynamic_support_rag_mode))
     if strict_prompt_formatting:
         lines.extend(
             [
@@ -1475,6 +2001,8 @@ def run_chat_request(
     response_depth: str = "Normal",
     strict_prompt_formatting: bool = True,
     inference_backend: str = "Auto",
+    enable_dynamic_support_rag: bool = False,
+    dynamic_support_rag_mode: str = "Builder",
 ) -> str:
     init_db(key)
     clean_prompt = sanitize_text(prompt)
@@ -1490,10 +2018,37 @@ def run_chat_request(
         )
 
     compiled_prompt = build_chat_prompt(model_prompt, memory, turns=memory_turns)
+    dynamic_support_rag_context = None
+    dynamic_support_rag_surface_name = ""
+    recent_dynamic_rag_surfaces: List[str] = []
+    if enable_dynamic_support_rag:
+        try:
+            recent_dynamic_rag_surfaces = load_dynamic_support_rag_history(key)
+        except Exception:
+            recent_dynamic_rag_surfaces = []
+        try:
+            dashboard_quantum_state = load_dashboard_quantum_color_state(key)
+        except Exception:
+            dashboard_quantum_state = {}
+        try:
+            dashboard_quantum_trail = load_dashboard_quantum_color_trail(key)
+        except Exception:
+            dashboard_quantum_trail = []
+        dynamic_rag_packet = build_dynamic_support_rag_packet(
+            dynamic_support_rag_mode,
+            recent_dynamic_rag_surfaces,
+            dashboard_quantum_state,
+            dashboard_quantum_trail,
+        )
+        dynamic_support_rag_context = dynamic_rag_packet["context"]
+        dynamic_support_rag_surface_name = dynamic_rag_packet["surface"]
     system_prompt = build_chat_system_prompt(
         chat_style=chat_style,
         response_depth=response_depth,
         strict_prompt_formatting=strict_prompt_formatting,
+        enable_dynamic_support_rag=enable_dynamic_support_rag,
+        dynamic_support_rag_mode=dynamic_support_rag_mode,
+        dynamic_support_rag_context=dynamic_support_rag_context,
     )
     with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
         reply = litert_chat_blocking(
@@ -1509,6 +2064,14 @@ def run_chat_request(
     if safe_image_path is not None:
         log_prompt = f"{model_prompt}\n[Image attached: {safe_image_path.name}]"
     log_interaction(log_prompt, sanitize_text(reply), key, session_id=session_id)
+    if enable_dynamic_support_rag and dynamic_support_rag_surface_name:
+        try:
+            save_dynamic_support_rag_history(
+                key,
+                [dynamic_support_rag_surface_name, *recent_dynamic_rag_surfaces],
+            )
+        except Exception:
+            pass
     return reply
 
 
@@ -2133,6 +2696,15 @@ class HumoidStudioApp(AppBase):
         self.history_search_var = tk.StringVar()
         self.history_status_var = tk.StringVar(value="Unlock the vault to search history.")
         self.settings_entropy_var = tk.BooleanVar(value=bool(self.settings_data.get("include_system_entropy", True)))
+        self.settings_dynamic_rag_var = tk.BooleanVar(value=bool(self.settings_data.get("enable_dynamic_support_rag", True)))
+        self.settings_dynamic_rag_mode_var = tk.StringVar(
+            value=normalize_setting_choice(
+                self.settings_data.get("dynamic_support_rag_mode"),
+                DYNAMIC_SUPPORT_RAG_MODE_OPTIONS,
+                "Builder",
+            )
+        )
+        self.settings_dynamic_rag_status_var = tk.StringVar()
         self.settings_delete_plaintext_var = tk.BooleanVar(
             value=bool(self.settings_data.get("delete_plaintext_after_encrypt", True))
         )
@@ -2164,6 +2736,9 @@ class HumoidStudioApp(AppBase):
         )
         self.update_chat_font_label()
         self.update_inference_backend_status()
+        self.update_dynamic_rag_status()
+        self.settings_dynamic_rag_var.trace_add("write", self.update_dynamic_rag_status)
+        self.settings_dynamic_rag_mode_var.trace_add("write", self.update_dynamic_rag_status)
         self.settings_inference_backend_var.trace_add("write", self.update_inference_backend_status)
         self.change_current_password_var = tk.StringVar()
         self.change_new_password_var = tk.StringVar()
@@ -2458,6 +3033,48 @@ class HumoidStudioApp(AppBase):
         except Exception:
             pass
 
+    def restore_saved_dashboard_quantum_color_state(self) -> bool:
+        if self.key is None:
+            return False
+        try:
+            state = load_dashboard_quantum_color_state(self.key)
+        except Exception:
+            return False
+        if not state:
+            return False
+
+        qid = state.get("qid", "")
+        color = state.get("color") or "#39ff88"
+        mood = state.get("mood") or f"QID-{qid} dashboard color restored"
+        self.current_qid_info = {
+            "qid": qid,
+            "color": color,
+            "mood": mood,
+            "rgb": state.get("rgb", ""),
+            "backend": state.get("backend", "Encrypted dashboard state"),
+        }
+        self.current_qid_sessions = []
+        self.ai_color_var.set(color)
+        self.ai_mood_var.set(f"{mood}\nQID-{qid} | {color}" if qid else f"{mood}\n{color}")
+        try:
+            text_color = "#031009" if self.color_luminance(color) > 120 else "#effff2"
+            if hasattr(self, "ai_color_swatch"):
+                self.ai_color_swatch.configure(
+                    fg_color=color,
+                    text=f"{color}\n{state.get('rgb', '') or 'restored'}",
+                    text_color=text_color,
+                )
+            if hasattr(self, "ai_color_chip"):
+                chip_label = f"{state.get('backend') or 'Encrypted QID'} | {qid or 'restored'}"
+                self.ai_color_chip.configure(
+                    fg_color=PALETTE["panel_alt"],
+                    text=chip_label,
+                    text_color=PALETTE["accent_gold"],
+                )
+        except Exception:
+            pass
+        return True
+
     def update_ai_qid_mood(self, sessions: List[Dict[str, Any]]) -> None:
         qid = qid_quantum_identity_from_sessions(sessions)
         color = qid["color"]
@@ -2465,6 +3082,17 @@ class HumoidStudioApp(AppBase):
         self.current_qid_sessions = [dict(session) for session in sessions[:6]]
         self.ai_color_var.set(color)
         self.ai_mood_var.set(qid["mood"])
+        if self.key is not None:
+            try:
+                save_dashboard_quantum_color_state(
+                    self.key,
+                    {
+                        **qid,
+                        "source": "dashboard-local-qid",
+                    },
+                )
+            except Exception:
+                pass
         try:
             text_color = "#031009" if self.color_luminance(color) > 120 else "#effff2"
             if hasattr(self, "ai_color_swatch"):
@@ -2504,6 +3132,16 @@ class HumoidStudioApp(AppBase):
         self.qid_mood_requested_signature = qid
         if not ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
             self.ai_mood_var.set(f"{self.current_qid_info.get('mood', 'QID ready')} Local model unavailable for mood naming.")
+            try:
+                save_dashboard_quantum_color_state(
+                    self.key,
+                    {
+                        **self.current_qid_info,
+                        "source": "dashboard-local-qid-no-model",
+                    },
+                )
+            except Exception:
+                pass
             return
 
         sessions_snapshot = [dict(session) for session in self.current_qid_sessions]
@@ -2517,11 +3155,41 @@ class HumoidStudioApp(AppBase):
 
         def on_success(mood: str) -> None:
             clean_mood = sanitize_text(mood, max_chars=160).strip()
+            self.current_qid_info["mood"] = clean_mood
+            self.current_qid_info["color"] = color
             self.ai_mood_var.set(f"{clean_mood}\nQID-{qid} | {color}")
+            try:
+                save_dashboard_quantum_color_state(
+                    self.key,
+                    {
+                        **self.current_qid_info,
+                        "qid": qid,
+                        "color": color,
+                        "mood": clean_mood,
+                        "source": "dashboard-gemma-mood",
+                    },
+                )
+                self.update_dynamic_rag_status()
+            except Exception as exc:
+                self.status_var.set(f"QID mood named, but encrypted mood save skipped: {sanitize_text(exc, max_chars=90)}")
+                return
             self.status_var.set("QID mood named by local Gemma.")
 
         def on_error(exc: Exception) -> None:
             self.ai_mood_var.set(f"{base_mood}\nGemma mood naming unavailable: {sanitize_text(exc, max_chars=90)}")
+            try:
+                save_dashboard_quantum_color_state(
+                    self.key,
+                    {
+                        **self.current_qid_info,
+                        "qid": qid,
+                        "color": color,
+                        "mood": base_mood,
+                        "source": "dashboard-local-qid-after-mood-error",
+                    },
+                )
+            except Exception:
+                pass
 
         self.run_process_task(
             "Naming the QID mood with local Gemma...",
@@ -2577,6 +3245,62 @@ class HumoidStudioApp(AppBase):
             self.settings_inference_backend_status_var.set(detail)
         except Exception:
             pass
+
+    def update_dynamic_rag_status(self, *_args: Any) -> None:
+        try:
+            mode = normalize_setting_choice(
+                self.settings_dynamic_rag_mode_var.get(),
+                DYNAMIC_SUPPORT_RAG_MODE_OPTIONS,
+                "Builder",
+            )
+            if not bool(self.settings_dynamic_rag_var.get()):
+                self.settings_dynamic_rag_status_var.set(
+                    "Off. Chat prompts use the normal style/depth system prompt only."
+                )
+                return
+            recent_note = ""
+            dashboard_quantum_state: Dict[str, str] = {}
+            dashboard_quantum_trail: List[Dict[str, str]] = []
+            if getattr(self, "key", None) is not None and not getattr(self, "busy", False):
+                try:
+                    recent_surfaces = load_dynamic_support_rag_history(self.key)
+                    if recent_surfaces:
+                        recent_note = " Recent encrypted rotation: " + ", ".join(recent_surfaces[:3]) + "."
+                except Exception:
+                    recent_note = " Recent encrypted rotation unavailable."
+                try:
+                    dashboard_quantum_state = load_dashboard_quantum_color_state(self.key)
+                    if dashboard_quantum_state:
+                        mood_preview = dashboard_quantum_state.get("mood", "")
+                        if len(mood_preview) > 64:
+                            mood_preview = mood_preview[:61].rstrip() + "..."
+                        recent_note += (
+                            " Dashboard color seed: "
+                            + (dashboard_quantum_state.get("color") or "unknown")
+                            + (f" | {mood_preview}" if mood_preview else "")
+                            + "."
+                        )
+                except Exception:
+                    recent_note += " Dashboard color seed unavailable."
+                try:
+                    dashboard_quantum_trail = load_dashboard_quantum_color_trail(self.key)
+                    trail_summary = dashboard_quantum_color_trail_summary(dashboard_quantum_trail)
+                    if trail_summary["count"] != "0":
+                        recent_note += (
+                            " Color trail: "
+                            f"{trail_summary['motion']} drift={trail_summary['drift']} "
+                            f"palette={trail_summary['palette']}."
+                        )
+                except Exception:
+                    recent_note += " Color trail unavailable."
+            self.settings_dynamic_rag_status_var.set(
+                "On. "
+                + dynamic_support_rag_status_line(mode, dashboard_quantum_state, dashboard_quantum_trail)
+                + ". Local-only support field, no weather/network."
+                + recent_note
+            )
+        except Exception as exc:
+            self.settings_dynamic_rag_status_var.set(f"Dynamic Support RAG status unavailable: {sanitize_text(exc, max_chars=90)}")
 
     def apply_chat_font_size(self, _value: Optional[float] = None) -> None:
         size = self.chat_font_size()
@@ -2928,7 +3652,7 @@ class HumoidStudioApp(AppBase):
         if not sessions:
             if self.key is None:
                 self.reset_qid_display()
-            elif not self.current_qid_info:
+            elif not self.current_qid_info and not self.restore_saved_dashboard_quantum_color_state():
                 self.update_ai_qid_mood([])
             ctk.CTkLabel(
                 self.recent_sessions_list,
@@ -2940,7 +3664,7 @@ class HumoidStudioApp(AppBase):
             ).pack(anchor="w", padx=18, pady=18)
             return
 
-        if not self.current_qid_info:
+        if not self.current_qid_info or not self.current_qid_sessions:
             self.update_ai_qid_mood(sessions)
         for idx, session in enumerate(sessions, start=1):
             title = sanitize_text(session.get("title", "Untitled session"), max_chars=90).replace("\n", " ").strip()
@@ -4021,8 +4745,9 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         tab = self.settings_tab
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
 
-        look = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        look = ctk.CTkScrollableFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
         look.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
 
         ctk.CTkLabel(look, text="Behavior", font=self.section_font, text_color=PALETTE["text"]).pack(
@@ -4041,6 +4766,72 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         )
         entropy_switch.pack(anchor="w", padx=20, pady=(0, 12))
         self.register_action(entropy_switch)
+
+        dynamic_rag_switch = ctk.CTkSwitch(
+            look,
+            text="Dynamic Support RAG for chat prompts",
+            variable=self.settings_dynamic_rag_var,
+            progress_color=PALETTE["accent_gold"],
+            button_color=PALETTE["accent_gold"],
+            button_hover_color="#75e69a",
+            text_color=PALETTE["text"],
+            font=self.body_font,
+        )
+        dynamic_rag_switch.pack(anchor="w", padx=20, pady=(0, 8))
+        self.register_action(dynamic_rag_switch)
+
+        dynamic_rag_row = ctk.CTkFrame(look, fg_color="transparent")
+        dynamic_rag_row.pack(anchor="w", fill="x", padx=20, pady=(0, 8))
+
+        dynamic_rag_menu = ctk.CTkOptionMenu(
+            dynamic_rag_row,
+            values=DYNAMIC_SUPPORT_RAG_MODE_OPTIONS,
+            variable=self.settings_dynamic_rag_mode_var,
+            fg_color=PALETTE["panel_alt"],
+            button_color=PALETTE["accent_gold"],
+            button_hover_color="#75e69a",
+            dropdown_fg_color=PALETTE["panel_alt"],
+            dropdown_hover_color=PALETTE["card_soft"],
+            text_color=PALETTE["text"],
+            font=self.body_font,
+            width=160,
+            height=36,
+            corner_radius=14,
+        )
+        dynamic_rag_menu.pack(side="left", padx=(0, 10))
+        self.register_action(dynamic_rag_menu)
+
+        refresh_dynamic_rag_button = self.make_button(
+            dynamic_rag_row,
+            "Refresh Field",
+            self.update_dynamic_rag_status,
+            4,
+            width=136,
+            height=36,
+        )
+        refresh_dynamic_rag_button.pack(side="left")
+        self.register_action(refresh_dynamic_rag_button, allow_during_busy=True)
+
+        ctk.CTkLabel(
+            look,
+            textvariable=self.settings_dynamic_rag_status_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        ctk.CTkLabel(
+            look,
+            text=(
+                "Wonder layer: mixes local entropy with the encrypted Dashboard Quantum Color seed and color trail, "
+                "then adds a first-principles lens, tiny-test prompt, and grounded-awe guardrail without quoting or imitating public figures."
+            ),
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=20, pady=(0, 12))
 
         delete_switch = ctk.CTkSwitch(
             look,
@@ -4854,6 +5645,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             INFERENCE_BACKEND_OPTIONS,
             "Auto",
         )
+        enable_dynamic_support_rag = bool(self.settings_dynamic_rag_var.get())
+        dynamic_support_rag_mode = normalize_setting_choice(
+            self.settings_dynamic_rag_mode_var.get(),
+            DYNAMIC_SUPPORT_RAG_MODE_OPTIONS,
+            "Builder",
+        )
         display_prompt = prompt
         if image_path:
             mode = "native" if native_image_input else "metadata"
@@ -4901,6 +5698,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 response_depth,
                 strict_prompt_formatting,
                 inference_backend,
+                enable_dynamic_support_rag,
+                dynamic_support_rag_mode,
             ),
             on_success=on_success,
             on_error=on_error,
@@ -5202,6 +6001,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
     def save_settings_action(self) -> None:
         current_settings = load_settings()
         self.settings_data["include_system_entropy"] = bool(self.settings_entropy_var.get())
+        self.settings_data["enable_dynamic_support_rag"] = bool(self.settings_dynamic_rag_var.get())
+        self.settings_data["dynamic_support_rag_mode"] = normalize_setting_choice(
+            self.settings_dynamic_rag_mode_var.get(),
+            DYNAMIC_SUPPORT_RAG_MODE_OPTIONS,
+            "Builder",
+        )
         self.settings_data["delete_plaintext_after_encrypt"] = bool(self.settings_delete_plaintext_var.get())
         self.settings_data["chat_memory_turns"] = int(self.settings_memory_turns_var.get())
         self.settings_data["chat_font_size"] = self.chat_font_size()
@@ -5228,11 +6033,13 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.settings_data["strict_prompt_formatting"] = bool(self.settings_strict_format_var.get())
         save_settings(self.settings_data)
         self.update_inference_backend_status()
+        self.update_dynamic_rag_status()
         self.status_var.set(
             "Settings saved. Prompt profile: "
             f"{self.settings_data['chat_style']} / {self.settings_data['response_depth']} "
             f"with {self.settings_data['chat_font_size']} px chat text. "
-            f"Inference: {self.settings_data['inference_backend']}."
+            f"Inference: {self.settings_data['inference_backend']}. "
+            f"Support RAG: {'on' if self.settings_data['enable_dynamic_support_rag'] else 'off'}."
         )
 
     def change_password_action(self) -> None:

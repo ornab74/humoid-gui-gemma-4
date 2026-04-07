@@ -1820,6 +1820,7 @@ class HumoidStudioApp(AppBase):
         self.current_qid_info: Dict[str, str] = {}
         self.current_qid_sessions: List[Dict[str, Any]] = []
         self.qid_mood_requested_signature = ""
+        self.qid_mood_auto_requested_this_load = False
         self.offer_model_download_after_unlock = False
         self.history_index_visible = False
         self.history_index_loading = False
@@ -2096,6 +2097,7 @@ class HumoidStudioApp(AppBase):
         self.session_title_requested = False
         self.key_status_var.set(f"Key: {'Passphrase' if key_mode == 'passphrase' else 'Legacy Raw'}")
         self.status_var.set("Studio unlocked. The vault is ready.")
+        self.qid_mood_auto_requested_this_load = False
         self.set_action_state(True)
         try:
             init_db(key)
@@ -2132,6 +2134,7 @@ class HumoidStudioApp(AppBase):
         self.current_qid_info = {}
         self.current_qid_sessions = []
         self.qid_mood_requested_signature = ""
+        self.qid_mood_auto_requested_this_load = False
         self.ai_color_var.set("#39ff88")
         self.ai_mood_var.set("Unlock the vault to generate a local QID mood from recent tabs.")
         try:
@@ -2172,6 +2175,8 @@ class HumoidStudioApp(AppBase):
     def request_qid_mood_generation(self, force: bool = False) -> None:
         if self.key is None:
             return
+        if not force and self.qid_mood_auto_requested_this_load:
+            return
         qid = self.current_qid_info.get("qid", "")
         color = self.current_qid_info.get("color", self.ai_color_var.get())
         if not qid:
@@ -2185,6 +2190,8 @@ class HumoidStudioApp(AppBase):
         if self.busy:
             self.after(900, lambda: self.request_qid_mood_generation(force=force))
             return
+        if not force:
+            self.qid_mood_auto_requested_this_load = True
         self.qid_mood_requested_signature = qid
         if not ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
             self.ai_mood_var.set(f"{self.current_qid_info.get('mood', 'QID ready')} Local model unavailable for mood naming.")
@@ -2208,6 +2215,7 @@ class HumoidStudioApp(AppBase):
             (self.key, qid, color, sessions_snapshot),
             on_success=on_success,
             on_error=on_error,
+            refresh_on_success=False,
         )
 
     def color_luminance(self, color: str) -> float:
@@ -2301,6 +2309,7 @@ class HumoidStudioApp(AppBase):
         *,
         on_success: Optional[Callable[[Any], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
+        refresh_on_success: bool = True,
     ) -> None:
         if self.busy:
             if messagebox:
@@ -2345,7 +2354,8 @@ class HumoidStudioApp(AppBase):
                 self.active_process = None
 
             if kind == "success":
-                self.task_queue.put(("success", payload, on_success))
+                queue_kind = "success" if refresh_on_success else "success_no_refresh"
+                self.task_queue.put((queue_kind, payload, on_success))
             else:
                 self.task_queue.put(("error", RuntimeError(str(payload)), on_error))
 
@@ -2551,29 +2561,23 @@ class HumoidStudioApp(AppBase):
         new_session_dash_button.grid(row=0, column=1, sticky="e")
         self.register_action(new_session_dash_button)
 
-        self.recent_sessions_tabview = ctk.CTkTabview(
+        self.recent_sessions_list = ctk.CTkScrollableFrame(
             recents_card,
             fg_color=PALETTE["panel_alt"],
             corner_radius=20,
             border_width=1,
             border_color=PALETTE["line"],
-            segmented_button_fg_color="#132018",
-            segmented_button_selected_color="#0d5f2f",
-            segmented_button_selected_hover_color="#12763a",
-            segmented_button_unselected_color="#101b13",
-            segmented_button_unselected_hover_color="#1a2a20",
-            text_color=PALETTE["text"],
         )
-        self.recent_sessions_tabview.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        self.recent_sessions_list.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
         self.render_recent_session_tabs([])
 
     def render_recent_session_tabs(self, sessions: List[Dict[str, Any]]) -> None:
-        if not hasattr(self, "recent_sessions_tabview"):
+        if not hasattr(self, "recent_sessions_list"):
             return
 
-        for tab_name in self.dashboard_recent_tabs:
+        for child in self.recent_sessions_list.winfo_children():
             try:
-                self.recent_sessions_tabview.delete(tab_name)
+                child.destroy()
             except Exception:
                 pass
         self.dashboard_recent_tabs = []
@@ -2581,15 +2585,10 @@ class HumoidStudioApp(AppBase):
         if not sessions:
             if self.key is None:
                 self.reset_qid_display()
-            else:
+            elif not self.current_qid_info:
                 self.update_ai_qid_mood([])
-                if self.qid_mood_requested_signature != self.current_qid_info.get("qid", ""):
-                    self.after(350, self.request_qid_mood_generation)
-            tab_name = "No Sessions"
-            tab = self.recent_sessions_tabview.add(tab_name)
-            self.dashboard_recent_tabs.append(tab_name)
             ctk.CTkLabel(
-                tab,
+                self.recent_sessions_list,
                 text="No saved chat sessions yet.\nSend a chat message and it will appear here from encrypted history.",
                 font=self.body_font,
                 text_color=PALETTE["muted"],
@@ -2598,30 +2597,32 @@ class HumoidStudioApp(AppBase):
             ).pack(anchor="w", padx=18, pady=18)
             return
 
-        self.update_ai_qid_mood(sessions)
-        if self.key is not None and self.qid_mood_requested_signature != self.current_qid_info.get("qid", ""):
-            self.after(350, self.request_qid_mood_generation)
+        if not self.current_qid_info:
+            self.update_ai_qid_mood(sessions)
         for idx, session in enumerate(sessions, start=1):
-            title = sanitize_text(session.get("title", "Untitled session"), max_chars=44).replace("\n", " ").strip()
-            tab_name = f"{idx}. {title[:24]}" if title else f"{idx}. Session"
-            while tab_name in self.dashboard_recent_tabs:
-                tab_name += "+"
-            tab = self.recent_sessions_tabview.add(tab_name)
-            tab.grid_columnconfigure(0, weight=1)
-            self.dashboard_recent_tabs.append(tab_name)
-
+            title = sanitize_text(session.get("title", "Untitled session"), max_chars=90).replace("\n", " ").strip()
             latest_prompt = sanitize_text(session.get("latest_prompt", ""), max_chars=900).replace("\n", " ").strip()
             first_prompt = sanitize_text(session.get("first_prompt", ""), max_chars=700).replace("\n", " ").strip()
             preview = latest_prompt or first_prompt or "No prompt preview saved for this session."
 
+            card = ctk.CTkFrame(
+                self.recent_sessions_list,
+                fg_color=PALETTE["card_soft"],
+                corner_radius=20,
+                border_width=1,
+                border_color=PALETTE["line"],
+            )
+            card.pack(anchor="w", fill="x", padx=12, pady=(12 if idx == 1 else 6, 6))
+            card.grid_columnconfigure(0, weight=1)
+
             ctk.CTkLabel(
-                tab,
+                card,
                 text=title or "Untitled session",
                 font=ctk.CTkFont(family="DejaVu Sans", size=20, weight="bold"),
                 text_color=PALETTE["text"],
                 justify="left",
                 wraplength=720,
-            ).pack(anchor="w", padx=18, pady=(18, 8))
+            ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
 
             details = (
                 f"Started: {sanitize_text(session.get('started_at', ''), max_chars=80)}\n"
@@ -2629,21 +2630,21 @@ class HumoidStudioApp(AppBase):
                 f"Saved turns: {int(session.get('turns', 0))}"
             )
             ctk.CTkLabel(
-                tab,
+                card,
                 text=details,
                 font=self.small_font,
                 text_color=PALETTE["muted"],
                 justify="left",
-            ).pack(anchor="w", padx=18, pady=(0, 14))
+            ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
 
             preview_card = ctk.CTkFrame(
-                tab,
-                fg_color=PALETTE["card_soft"],
-                corner_radius=18,
+                card,
+                fg_color=PALETTE["panel_alt"],
+                corner_radius=16,
                 border_width=1,
                 border_color=PALETTE["line"],
             )
-            preview_card.pack(anchor="w", fill="x", padx=18, pady=(0, 16))
+            preview_card.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
             ctk.CTkLabel(
                 preview_card,
                 text="Latest prompt",
@@ -2659,8 +2660,8 @@ class HumoidStudioApp(AppBase):
                 wraplength=720,
             ).pack(anchor="w", fill="x", padx=14, pady=(0, 14))
 
-            actions = ctk.CTkFrame(tab, fg_color="transparent")
-            actions.pack(anchor="w", padx=18, pady=(0, 18))
+            actions = ctk.CTkFrame(card, fg_color="transparent")
+            actions.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 14))
             self.make_button(
                 actions,
                 "Open Chat",
@@ -4355,7 +4356,6 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.current_session_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
             self.current_session_title = f"Session {self.current_session_started_at}"
             self.session_title_requested = False
-            self.refresh_dashboard()
         return self.current_session_id
 
     def save_first_prompt_session_title(self, prompt: str, reply: str) -> None:
@@ -4411,6 +4411,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         def on_success(reply: str) -> None:
             safe_reply = sanitize_text(reply)
             memory_prompt = display_prompt if image_path else prompt
+            needs_first_prompt_title = self.current_session_id is not None and not self.session_title_requested
             self.chat_memory.extend([("user", memory_prompt), ("assistant", safe_reply)])
             self.tts_last_text = safe_reply
             self.append_chat_message("Gemma", safe_reply)
@@ -4419,6 +4420,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             if self.tts_enabled_var.get():
                 self.speak_text(safe_reply)
             self.save_first_prompt_session_title(prompt, safe_reply)
+            if not needs_first_prompt_title:
+                self.refresh_dashboard()
 
         def on_error(exc: Exception) -> None:
             self.status_var.set(str(exc))
@@ -4445,6 +4448,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             ),
             on_success=on_success,
             on_error=on_error,
+            refresh_on_success=False,
         )
 
     def download_model_action(self, confirm: bool = True) -> None:
@@ -4460,8 +4464,6 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.hash_status_var.set(f"Hash: Verified {sha[:12]}...")
             self.status_var.set("Model download finished and the encrypted vault is ready.")
             self.refresh_dashboard()
-            self.qid_mood_requested_signature = ""
-            self.after(500, lambda: self.request_qid_mood_generation(force=True))
 
         self.run_task(
             "Downloading and sealing the model vault...",

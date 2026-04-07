@@ -2675,7 +2675,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_output.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 16))
         self.chat_output.insert(
             "1.0",
-            "Humoid Gemma Studio is ready for local prompts once the vault is unlocked.\n\n",
+            "Local Chat.\n\n",
         )
         self.chat_output.configure(state="disabled")
         self.configure_textbox_tags(self.chat_output)

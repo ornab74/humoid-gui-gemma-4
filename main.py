@@ -23,6 +23,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("GLOG_minloglevel", "2")
+
 import httpx
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -102,13 +105,24 @@ LATEX_COMMAND_REPLACEMENTS = {
     r"\kappa": "κ",
     r"\lambda": "λ",
     r"\mu": "μ",
+    r"\nu": "ν",
+    r"\xi": "ξ",
     r"\rho": "ρ",
     r"\pi": "π",
     r"\sigma": "σ",
     r"\tau": "τ",
     r"\phi": "φ",
+    r"\psi": "ψ",
     r"\omega": "ω",
+    r"\Gamma": "Γ",
     r"\Delta": "Δ",
+    r"\Theta": "Θ",
+    r"\Lambda": "Λ",
+    r"\Xi": "Ξ",
+    r"\Pi": "Π",
+    r"\Sigma": "Σ",
+    r"\Phi": "Φ",
+    r"\Psi": "Ψ",
     r"\Omega": "Ω",
     r"\partial": "∂",
     r"\nabla": "∇",
@@ -126,13 +140,53 @@ LATEX_COMMAND_REPLACEMENTS = {
     r"\sum": "Σ",
     r"\prod": "Π",
     r"\int": "∫",
+    r"\langle": "⟨",
+    r"\rangle": "⟩",
+    r"\le": "≤",
+    r"\ge": "≥",
+    r"\to": "→",
     r"\rightarrow": "→",
     r"\leftarrow": "←",
     r"\Rightarrow": "⇒",
     r"\Leftarrow": "⇐",
 }
-SUPERSCRIPT_TRANS = str.maketrans("0123456789+-=()nixy", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱˣʸ")
-SUBSCRIPT_TRANS = str.maketrans("0123456789+-=()nixy", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₙᵢₓᵧ")
+SUPERSCRIPT_CHARS = {
+    **{str(index): char for index, char in enumerate("⁰¹²³⁴⁵⁶⁷⁸⁹")},
+    "+": "⁺",
+    "-": "⁻",
+    "=": "⁼",
+    "(": "⁽",
+    ")": "⁾",
+    "n": "ⁿ",
+    "i": "ⁱ",
+    "x": "ˣ",
+    "y": "ʸ",
+}
+SUBSCRIPT_CHARS = {
+    **{str(index): char for index, char in enumerate("₀₁₂₃₄₅₆₇₈₉")},
+    "+": "₊",
+    "-": "₋",
+    "=": "₌",
+    "(": "₍",
+    ")": "₎",
+    "a": "ₐ",
+    "e": "ₑ",
+    "h": "ₕ",
+    "i": "ᵢ",
+    "j": "ⱼ",
+    "k": "ₖ",
+    "l": "ₗ",
+    "m": "ₘ",
+    "n": "ₙ",
+    "o": "ₒ",
+    "p": "ₚ",
+    "r": "ᵣ",
+    "s": "ₛ",
+    "t": "ₜ",
+    "u": "ᵤ",
+    "v": "ᵥ",
+    "x": "ₓ",
+}
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -168,6 +222,8 @@ TIE_DYE = [
 
 CHAT_STYLE_OPTIONS = ["Balanced", "Code", "Teacher", "Creative", "Research"]
 CHAT_DEPTH_OPTIONS = ["Brief", "Normal", "Deep"]
+INFERENCE_BACKEND_OPTIONS = ["Auto", "CPU", "GPU"]
+INFERENCE_AUTO_SELECTED_OPTIONS = ["", "CPU", "GPU"]
 CHAT_STYLE_GUIDES = {
     "Balanced": "Be warm, useful, and direct. Match the user's energy without overexplaining.",
     "Code": "Prioritize correct runnable code, compact explanations, edge cases, and safe local assumptions.",
@@ -187,6 +243,8 @@ DEFAULT_SETTINGS = {
     "chat_memory_turns": 6,
     "chat_font_size": 13,
     "enable_native_image_input": True,
+    "inference_backend": "Auto",
+    "auto_selected_inference_backend": "",
     "chat_style": "Balanced",
     "response_depth": "Normal",
     "strict_prompt_formatting": True,
@@ -265,31 +323,60 @@ def render_markdown_for_display(value: Any, *, max_chars: int = 20000) -> str:
 def render_latex_for_display(value: Any) -> str:
     text = sanitize_text(value, max_chars=4000).strip()
 
+    def replace_script(match: re.Match[str], mapping: Dict[str, str], prefix: str) -> str:
+        content = re.sub(r"\s+", "", match.group(1))
+        if content and all(char in mapping for char in content):
+            return "".join(mapping[char] for char in content)
+        return f"{prefix}({content})" if content else ""
+
     def replace_fraction(match: re.Match[str]) -> str:
-        return f"({match.group(1)})/({match.group(2)})"
+        numerator = render_latex_for_display(match.group(1))
+        denominator = render_latex_for_display(match.group(2))
+        return f"({numerator})/({denominator})"
 
     def replace_sqrt(match: re.Match[str]) -> str:
-        return f"√({match.group(1)})"
+        return f"√({render_latex_for_display(match.group(1))})"
 
+    text = re.sub(r"^```(?:latex|tex|math)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\\label\{[^{}]*\}", "", text)
+    text = re.sub(r"\\tag\{[^{}]*\}", "", text)
+    text = re.sub(r"\\nonumber\b", "", text)
     text = re.sub(r"\\begin\{[^{}]+\}|\\end\{[^{}]+\}", "", text)
+    text = text.replace(r"\[", "").replace(r"\]", "")
+    text = text.replace("$$", "")
     text = text.replace(r"\\", "\n")
-    text = text.replace("&", "")
-    text = re.sub(r"\\(?:mathrm|mathbf|mathit|text|boxed)\{([^{}]+)\}", r"\1", text)
+    text = text.replace("&=", "=").replace("&", "")
+    text = re.sub(r"\\(?:mathrm|mathbf|mathit|text|boxed|operatorname)\{([^{}]+)\}", r"\1", text)
+    text = re.sub(r"\\(?:hat|vec|bar|tilde)\{([^{}]+)\}", r"\1", text)
     text = re.sub(r"\\mathbb\{R\}", "ℝ", text)
     text = re.sub(r"\\mathbb\{N\}", "ℕ", text)
     text = re.sub(r"\\mathbb\{Z\}", "ℤ", text)
     text = re.sub(r"\\mathbb\{Q\}", "ℚ", text)
     text = re.sub(r"\\mathbb\{C\}", "ℂ", text)
-    text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", replace_fraction, text)
-    text = re.sub(r"\\sqrt\{([^{}]+)\}", replace_sqrt, text)
+    text = re.sub(r"\\ket\{([^{}]+)\}", lambda match: f"|{render_latex_for_display(match.group(1))}⟩", text)
+    text = re.sub(r"\\bra\{([^{}]+)\}", lambda match: f"⟨{render_latex_for_display(match.group(1))}|", text)
+    text = re.sub(
+        r"\\braket\{([^{}]+)\}\{([^{}]+)\}",
+        lambda match: f"⟨{render_latex_for_display(match.group(1))}|{render_latex_for_display(match.group(2))}⟩",
+        text,
+    )
+    for _ in range(4):
+        updated_text = re.sub(r"\\sqrt\{([^{}]+)\}", replace_sqrt, text)
+        updated_text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", replace_fraction, updated_text)
+        if updated_text == text:
+            break
+        text = updated_text
+    text = text.replace(r"\left", "").replace(r"\right", "")
     for command, replacement in LATEX_COMMAND_REPLACEMENTS.items():
         text = text.replace(command, replacement)
-    text = re.sub(r"\^\{([0-9+\-=()nixy]+)\}", lambda match: match.group(1).translate(SUPERSCRIPT_TRANS), text)
-    text = re.sub(r"_\{([0-9+\-=()nixy]+)\}", lambda match: match.group(1).translate(SUBSCRIPT_TRANS), text)
-    text = re.sub(r"\^([0-9+\-=()nixy])", lambda match: match.group(1).translate(SUPERSCRIPT_TRANS), text)
-    text = re.sub(r"_([0-9+\-=()nixy])", lambda match: match.group(1).translate(SUBSCRIPT_TRANS), text)
-    text = text.replace(r"\left", "").replace(r"\right", "")
+    text = re.sub(r"\^\{([^{}]+)\}", lambda match: replace_script(match, SUPERSCRIPT_CHARS, "^"), text)
+    text = re.sub(r"_\{([^{}]+)\}", lambda match: replace_script(match, SUBSCRIPT_CHARS, "_"), text)
+    text = re.sub(r"\^([A-Za-z0-9+\-=()])", lambda match: replace_script(match, SUPERSCRIPT_CHARS, "^"), text)
+    text = re.sub(r"_([A-Za-z0-9+\-=()])", lambda match: replace_script(match, SUBSCRIPT_CHARS, "_"), text)
+    text = text.replace(r"\quad", "  ").replace(r"\qquad", "    ")
+    text = text.replace(r"\,", " ").replace(r"\;", " ").replace(r"\:", " ").replace(r"\!", "")
     text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\\[a-zA-Z]+", "", text)
     text = "\n".join(re.sub(r"\s+", " ", line).strip() for line in text.splitlines())
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -868,26 +955,65 @@ def require_litert_lm() -> None:
         )
 
 
-def load_litert_engine(model_path: Path, cache_dir: Optional[Path] = None, *, enable_vision: bool = False):
+def load_litert_engine(
+    model_path: Path,
+    cache_dir: Optional[Path] = None,
+    *,
+    enable_vision: bool = False,
+    inference_backend: str = "Auto",
+):
     require_litert_lm()
     try:
         litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
     except Exception:
         pass
+
+    backend_name, auto_selected = resolve_inference_backend_name(inference_backend)
+    try:
+        backend_value = backend_value_for_name(backend_name)
+    except RuntimeError:
+        if auto_selected and backend_name == "GPU":
+            save_auto_inference_backend_selection("CPU")
+            backend_name = "CPU"
+            backend_value = _litert_cpu_backend()
+        else:
+            raise
     engine_kwargs = {
-        "backend": litert_lm.Backend.CPU,
+        "backend": backend_value,
         "cache_dir": str(cache_dir or CACHE_DIR),
     }
     if enable_vision:
-        engine_kwargs["vision_backend"] = litert_lm.Backend.CPU
+        engine_kwargs["vision_backend"] = backend_value
     try:
         return litert_lm.Engine(str(model_path), **engine_kwargs)
     except TypeError as exc:
+        if auto_selected and backend_name == "GPU":
+            save_auto_inference_backend_selection("CPU")
+            cpu_backend = _litert_cpu_backend()
+            engine_kwargs["backend"] = cpu_backend
+            if enable_vision:
+                engine_kwargs["vision_backend"] = cpu_backend
+            try:
+                return litert_lm.Engine(str(model_path), **engine_kwargs)
+            except TypeError:
+                pass
         if enable_vision:
             raise RuntimeError(
                 "This installed LiteRT-LM package rejected vision_backend. "
                 "Upgrade litert-lm before using native Gemma 4 image input."
             ) from exc
+        raise
+    except Exception as exc:
+        if auto_selected and backend_name == "GPU":
+            save_auto_inference_backend_selection("CPU")
+            cpu_backend = _litert_cpu_backend()
+            engine_kwargs["backend"] = cpu_backend
+            if enable_vision:
+                engine_kwargs["vision_backend"] = cpu_backend
+            try:
+                return litert_lm.Engine(str(model_path), **engine_kwargs)
+            except Exception:
+                raise exc
         raise
 
 
@@ -938,6 +1064,91 @@ def create_user_message(user_text: str, image_path: Optional[str] = None) -> Any
     }
 
 
+def _litert_backend_attr(*names: str) -> Any:
+    require_litert_lm()
+    for name in names:
+        try:
+            return getattr(litert_lm.Backend, name)
+        except Exception:
+            continue
+    return None
+
+
+def _litert_cpu_backend() -> Any:
+    backend = _litert_backend_attr("CPU")
+    if backend is None:
+        raise RuntimeError("This LiteRT-LM build does not expose a CPU backend.")
+    return backend
+
+
+def _litert_gpu_backend() -> Any:
+    backend = _litert_backend_attr("GPU", "WEBGPU", "WEB_GPU", "GPU_WEBGPU")
+    if backend is None:
+        available = ", ".join(name for name in dir(litert_lm.Backend) if not name.startswith("_"))
+        raise RuntimeError(
+            "GPU inference was selected, but this installed LiteRT-LM package does not expose a GPU backend enum. "
+            f"Available backends: {available or 'unknown'}."
+        )
+    return backend
+
+
+def gpu_inference_looks_available() -> bool:
+    if os.environ.get("HUMOIDS_DISABLE_GPU_AUTO") == "1":
+        return False
+    if os.environ.get("HUMOIDS_FORCE_GPU_AUTO") == "1":
+        return True
+    if sys.platform.startswith("linux"):
+        try:
+            dri_path = Path("/dev/dri")
+            if dri_path.exists() and any(dri_path.glob("renderD*")):
+                return True
+        except Exception:
+            pass
+        return any(Path(path).exists() for path in ("/dev/nvidia0", "/dev/nvidiactl"))
+    return True
+
+
+def choose_auto_inference_backend_name() -> str:
+    gpu_backend = _litert_backend_attr("GPU", "WEBGPU", "WEB_GPU", "GPU_WEBGPU")
+    return "GPU" if gpu_backend is not None and gpu_inference_looks_available() else "CPU"
+
+
+def save_auto_inference_backend_selection(backend_name: str) -> None:
+    selected = normalize_setting_choice(backend_name, ["CPU", "GPU"], "CPU")
+    try:
+        settings = load_settings()
+        settings["inference_backend"] = "Auto"
+        settings["auto_selected_inference_backend"] = selected
+        save_settings(settings)
+    except Exception:
+        pass
+
+
+def resolve_inference_backend_name(inference_backend: str = "Auto") -> Tuple[str, bool]:
+    preference = normalize_setting_choice(inference_backend, INFERENCE_BACKEND_OPTIONS, "Auto")
+    if preference != "Auto":
+        return preference, False
+
+    saved_settings = load_settings()
+    saved_backend = normalize_setting_choice(
+        saved_settings.get("auto_selected_inference_backend"),
+        INFERENCE_AUTO_SELECTED_OPTIONS,
+        "",
+    )
+    if saved_backend:
+        return saved_backend, True
+
+    selected = choose_auto_inference_backend_name()
+    save_auto_inference_backend_selection(selected)
+    return selected, True
+
+
+def backend_value_for_name(backend_name: str) -> Any:
+    if backend_name == "GPU":
+        return _litert_gpu_backend()
+    return _litert_cpu_backend()
+
+
 def litert_chat_blocking(
     model_path: Path,
     user_text: str,
@@ -946,8 +1157,14 @@ def litert_chat_blocking(
     image_path: Optional[str] = None,
     cache_dir: Optional[Path] = None,
     enable_vision: bool = False,
+    inference_backend: str = "Auto",
 ) -> str:
-    engine = load_litert_engine(model_path, cache_dir=cache_dir, enable_vision=enable_vision)
+    engine = load_litert_engine(
+        model_path,
+        cache_dir=cache_dir,
+        enable_vision=enable_vision,
+        inference_backend=inference_backend,
+    )
     with engine:
         messages = create_default_messages(system_text)
         with engine.create_conversation(messages=messages) as conversation:
@@ -1108,6 +1325,14 @@ def load_settings() -> Dict[str, Any]:
     settings.update({k: raw.get(k, v) for k, v in DEFAULT_SETTINGS.items()})
     if "enable_native_image_input" not in raw and configured_model_supports_native_image_input():
         settings["enable_native_image_input"] = True
+    settings["inference_backend"] = normalize_setting_choice(
+        settings.get("inference_backend"), INFERENCE_BACKEND_OPTIONS, "Auto"
+    )
+    settings["auto_selected_inference_backend"] = normalize_setting_choice(
+        settings.get("auto_selected_inference_backend"),
+        INFERENCE_AUTO_SELECTED_OPTIONS,
+        "",
+    )
     return settings
 
 
@@ -1204,6 +1429,7 @@ def run_chat_request(
     chat_style: str = "Balanced",
     response_depth: str = "Normal",
     strict_prompt_formatting: bool = True,
+    inference_backend: str = "Auto",
 ) -> str:
     init_db(key)
     clean_prompt = sanitize_text(prompt)
@@ -1232,6 +1458,7 @@ def run_chat_request(
             image_path=model_image_path,
             cache_dir=cache_dir,
             enable_vision=bool(model_image_path),
+            inference_backend=inference_backend,
         )
     log_prompt = clean_prompt
     if safe_image_path is not None:
@@ -1240,7 +1467,13 @@ def run_chat_request(
     return reply
 
 
-def run_qid_mood_request(key: bytes, qid: str, color: str, sessions: List[Dict[str, Any]]) -> str:
+def run_qid_mood_request(
+    key: bytes,
+    qid: str,
+    color: str,
+    sessions: List[Dict[str, Any]],
+    inference_backend: str = "Auto",
+) -> str:
     session_lines = []
     for session in sessions[:6]:
         session_lines.append(
@@ -1264,6 +1497,7 @@ def run_qid_mood_request(key: bytes, qid: str, color: str, sessions: List[Dict[s
             prompt,
             system_text="You create short tasteful UI mood labels. Return one line only.",
             cache_dir=cache_dir,
+            inference_backend=inference_backend,
         )
     mood = sanitize_text(raw_mood, max_chars=140).strip().replace("\n", " ")
     mood = re.sub(r"\s+", " ", mood).strip().strip('"').strip("'")
@@ -1329,11 +1563,22 @@ def qid_quantum_identity_from_sessions(sessions: List[Dict[str, Any]]) -> Dict[s
     }
 
 
-def run_road_scan(key: bytes, data: Dict[str, str], include_system_entropy: bool) -> Dict[str, str]:
+def run_road_scan(
+    key: bytes,
+    data: Dict[str, str],
+    include_system_entropy: bool,
+    inference_backend: str = "Auto",
+) -> Dict[str, str]:
     init_db(key)
     system_text, prompt = build_road_scanner_prompt(data, include_system_entropy=include_system_entropy)
     with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
-        raw = litert_chat_blocking(model_path, prompt, system_text=system_text, cache_dir=cache_dir)
+        raw = litert_chat_blocking(
+            model_path,
+            prompt,
+            system_text=system_text,
+            cache_dir=cache_dir,
+            inference_backend=inference_backend,
+        )
     label = normalize_risk_label(raw)
     log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
     return {
@@ -1788,6 +2033,7 @@ class HumoidStudioApp(AppBase):
             raise RuntimeError("The GUI dependencies are not available.")
         super().__init__()
         self.settings_data = load_settings()
+        self.closing = False
         self.key: Optional[bytes] = None
         self.key_mode = "locked"
         self.busy = False
@@ -1854,6 +2100,14 @@ class HumoidStudioApp(AppBase):
         self.chat_font_size_label_var = tk.StringVar()
         self.chat_input_stats_var = tk.StringVar(value="0 chars | 0 lines | Shift+Enter for newline")
         self.settings_native_image_var = tk.BooleanVar(value=bool(self.settings_data.get("enable_native_image_input", False)))
+        self.settings_inference_backend_var = tk.StringVar(
+            value=normalize_setting_choice(
+                self.settings_data.get("inference_backend"),
+                INFERENCE_BACKEND_OPTIONS,
+                "Auto",
+            )
+        )
+        self.settings_inference_backend_status_var = tk.StringVar()
         self.settings_chat_style_var = tk.StringVar(
             value=normalize_setting_choice(self.settings_data.get("chat_style"), CHAT_STYLE_OPTIONS, "Balanced")
         )
@@ -1864,6 +2118,8 @@ class HumoidStudioApp(AppBase):
             value=bool(self.settings_data.get("strict_prompt_formatting", True))
         )
         self.update_chat_font_label()
+        self.update_inference_backend_status()
+        self.settings_inference_backend_var.trace_add("write", self.update_inference_backend_status)
         self.change_current_password_var = tk.StringVar()
         self.change_new_password_var = tk.StringVar()
         self.change_confirm_password_var = tk.StringVar()
@@ -1984,17 +2240,24 @@ class HumoidStudioApp(AppBase):
         self.set_action_state(False)
 
     def draw_background(self, _event: Optional[Any] = None) -> None:
-        width = max(1, self.winfo_width())
-        height = max(1, self.winfo_height())
-        self.background.delete("all")
-        self.background.create_rectangle(0, 0, width, height, fill=PALETTE["canvas"], outline="")
-        self.background.create_oval(-140, -120, width * 0.38, height * 0.42, fill="#0d2514", outline="")
-        self.background.create_oval(width * 0.50, -110, width + 140, height * 0.36, fill="#12301c", outline="")
-        self.background.create_oval(width * 0.16, height * 0.42, width * 0.88, height + 160, fill="#0a1a10", outline="")
-        self.background.create_oval(width * 0.66, height * 0.30, width + 120, height + 90, fill="#143825", outline="")
-        self.background.create_oval(-90, height * 0.58, width * 0.34, height + 120, fill="#0f2216", outline="")
-        for y in range(0, height, 34):
-            self.background.create_line(0, y, width, y, fill="#0d1d13")
+        if getattr(self, "closing", False) or not hasattr(self, "background"):
+            return
+        try:
+            if not self.background.winfo_exists():
+                return
+            width = max(1, self.winfo_width())
+            height = max(1, self.winfo_height())
+            self.background.delete("all")
+            self.background.create_rectangle(0, 0, width, height, fill=PALETTE["canvas"], outline="")
+            self.background.create_oval(-140, -120, width * 0.38, height * 0.42, fill="#0d2514", outline="")
+            self.background.create_oval(width * 0.50, -110, width + 140, height * 0.36, fill="#12301c", outline="")
+            self.background.create_oval(width * 0.16, height * 0.42, width * 0.88, height + 160, fill="#0a1a10", outline="")
+            self.background.create_oval(width * 0.66, height * 0.30, width + 120, height + 90, fill="#143825", outline="")
+            self.background.create_oval(-90, height * 0.58, width * 0.34, height + 120, fill="#0f2216", outline="")
+            for y in range(0, height, 34):
+                self.background.create_line(0, y, width, y, fill="#0d1d13")
+        except Exception:
+            return
 
     def make_chip(self, parent: Any, variable: tk.StringVar, color: str) -> ctk.CTkLabel:
         return ctk.CTkLabel(
@@ -2199,6 +2462,11 @@ class HumoidStudioApp(AppBase):
 
         sessions_snapshot = [dict(session) for session in self.current_qid_sessions]
         base_mood = self.current_qid_info.get("mood", f"QID-{qid}")
+        inference_backend = normalize_setting_choice(
+            self.settings_inference_backend_var.get(),
+            INFERENCE_BACKEND_OPTIONS,
+            "Auto",
+        )
         self.ai_mood_var.set(f"{base_mood}\nAsking Gemma to name this identity...")
 
         def on_success(mood: str) -> None:
@@ -2212,7 +2480,7 @@ class HumoidStudioApp(AppBase):
         self.run_process_task(
             "Naming the QID mood with local Gemma...",
             "qid_mood",
-            (self.key, qid, color, sessions_snapshot),
+            (self.key, qid, color, sessions_snapshot, inference_backend),
             on_success=on_success,
             on_error=on_error,
             refresh_on_success=False,
@@ -2239,6 +2507,28 @@ class HumoidStudioApp(AppBase):
     def update_chat_font_label(self) -> None:
         try:
             self.chat_font_size_label_var.set(f"Chatbox font size: {self.chat_font_size()} px")
+        except Exception:
+            pass
+
+    def update_inference_backend_status(self, *_args: Any) -> None:
+        try:
+            preference = normalize_setting_choice(
+                self.settings_inference_backend_var.get(),
+                INFERENCE_BACKEND_OPTIONS,
+                "Auto",
+            )
+            current_settings = load_settings()
+            selected = normalize_setting_choice(
+                current_settings.get("auto_selected_inference_backend"),
+                INFERENCE_AUTO_SELECTED_OPTIONS,
+                "",
+            )
+            self.settings_data["auto_selected_inference_backend"] = selected
+            if preference == "Auto":
+                detail = f"Auto selected: {selected}" if selected else "Auto will choose GPU if available, otherwise CPU, on first model load."
+            else:
+                detail = f"Manual mode: {preference}"
+            self.settings_inference_backend_status_var.set(detail)
         except Exception:
             pass
 
@@ -2362,6 +2652,8 @@ class HumoidStudioApp(AppBase):
         threading.Thread(target=watcher, daemon=True).start()
 
     def process_task_queue(self) -> None:
+        if getattr(self, "closing", False):
+            return
         try:
             while True:
                 event = self.task_queue.get_nowait()
@@ -2381,6 +2673,7 @@ class HumoidStudioApp(AppBase):
                 elif kind == "success":
                     _, result, callback = event
                     self.set_busy(False)
+                    self.update_inference_backend_status()
                     self.refresh_dashboard()
                     if callback:
                         callback(result)
@@ -2390,6 +2683,7 @@ class HumoidStudioApp(AppBase):
                 elif kind == "success_no_refresh":
                     _, result, callback = event
                     self.set_busy(False)
+                    self.update_inference_backend_status()
                     if callback:
                         callback(result)
                     elif self.status_var.get() == "":
@@ -2409,6 +2703,7 @@ class HumoidStudioApp(AppBase):
                 elif kind == "error":
                     _, exc, callback = event
                     self.set_busy(False)
+                    self.update_inference_backend_status()
                     self.refresh_dashboard()
                     if callback:
                         callback(exc)
@@ -2424,6 +2719,8 @@ class HumoidStudioApp(AppBase):
         self.after(120, self.process_task_queue)
 
     def update_dashboard_clock(self) -> None:
+        if getattr(self, "closing", False):
+            return
         self.dashboard_clock_var.set(time.strftime("%A, %B %d, %Y\n%I:%M:%S %p"))
         self.after(1000, self.update_dashboard_clock)
 
@@ -3702,8 +3999,42 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             look,
             text=(
                 "Gemma 4 accepts both text and image input. If this is on, validated image prompts use the native "
-                "vision path with a CPU vision backend."
+                "vision path with the selected inference backend when the runtime accepts it."
             ),
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        ctk.CTkLabel(
+            look,
+            text="Inference Backend",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(anchor="w", padx=20, pady=(4, 6))
+
+        backend_menu = ctk.CTkOptionMenu(
+            look,
+            values=INFERENCE_BACKEND_OPTIONS,
+            variable=self.settings_inference_backend_var,
+            fg_color=PALETTE["panel_alt"],
+            button_color=PALETTE["accent_teal"],
+            button_hover_color="#00b85c",
+            dropdown_fg_color=PALETTE["panel_alt"],
+            dropdown_hover_color=PALETTE["card_soft"],
+            text_color=PALETTE["text"],
+            font=self.body_font,
+            width=240,
+            height=38,
+            corner_radius=14,
+        )
+        backend_menu.pack(anchor="w", padx=20, pady=(0, 8))
+        self.register_action(backend_menu)
+
+        ctk.CTkLabel(
+            look,
+            textvariable=self.settings_inference_backend_status_var,
             font=self.small_font,
             text_color=PALETTE["muted"],
             justify="left",
@@ -3985,7 +4316,11 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                         break
                     code_lines.append(lines[line_index])
                     line_index += 1
-                self.insert_markdown_code_block(textbox, text_widget, code_language, code_lines)
+                if code_language.lower() in {"latex", "tex", "math", "equation", "align"}:
+                    math_text = render_latex_for_display("\n".join(code_lines))
+                    text_widget.insert("end", f"  {math_text}\n", ("md_math_block",))
+                else:
+                    self.insert_markdown_code_block(textbox, text_widget, code_language, code_lines)
                 if line_index < len(lines):
                     line_index += 1
                 continue
@@ -4441,6 +4776,11 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         chat_style = normalize_setting_choice(self.settings_chat_style_var.get(), CHAT_STYLE_OPTIONS, "Balanced")
         response_depth = normalize_setting_choice(self.settings_response_depth_var.get(), CHAT_DEPTH_OPTIONS, "Normal")
         strict_prompt_formatting = bool(self.settings_strict_format_var.get())
+        inference_backend = normalize_setting_choice(
+            self.settings_inference_backend_var.get(),
+            INFERENCE_BACKEND_OPTIONS,
+            "Auto",
+        )
         display_prompt = prompt
         if image_path:
             mode = "native" if native_image_input else "metadata"
@@ -4487,6 +4827,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 chat_style,
                 response_depth,
                 strict_prompt_formatting,
+                inference_backend,
             ),
             on_success=on_success,
             on_error=on_error,
@@ -4572,6 +4913,11 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             return
         data = self.collect_road_form()
         include_entropy = bool(self.settings_data.get("include_system_entropy", True))
+        inference_backend = normalize_setting_choice(
+            self.settings_inference_backend_var.get(),
+            INFERENCE_BACKEND_OPTIONS,
+            "Auto",
+        )
 
         def on_success(result: Dict[str, str]) -> None:
             self.last_scan_result = dict(result)
@@ -4593,7 +4939,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.run_process_task(
             "Running the road scanner locally...",
             "road_scan",
-            (self.key, data, include_entropy),
+            (self.key, data, include_entropy, inference_backend),
             on_success=on_success,
         )
 
@@ -4781,11 +5127,25 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 start = end
 
     def save_settings_action(self) -> None:
+        current_settings = load_settings()
         self.settings_data["include_system_entropy"] = bool(self.settings_entropy_var.get())
         self.settings_data["delete_plaintext_after_encrypt"] = bool(self.settings_delete_plaintext_var.get())
         self.settings_data["chat_memory_turns"] = int(self.settings_memory_turns_var.get())
         self.settings_data["chat_font_size"] = self.chat_font_size()
         self.settings_data["enable_native_image_input"] = bool(self.settings_native_image_var.get())
+        self.settings_data["inference_backend"] = normalize_setting_choice(
+            self.settings_inference_backend_var.get(),
+            INFERENCE_BACKEND_OPTIONS,
+            "Auto",
+        )
+        if self.settings_data["inference_backend"] == "Auto":
+            self.settings_data["auto_selected_inference_backend"] = normalize_setting_choice(
+                current_settings.get("auto_selected_inference_backend"),
+                INFERENCE_AUTO_SELECTED_OPTIONS,
+                "",
+            )
+        else:
+            self.settings_data["auto_selected_inference_backend"] = ""
         self.settings_data["chat_style"] = normalize_setting_choice(
             self.settings_chat_style_var.get(), CHAT_STYLE_OPTIONS, "Balanced"
         )
@@ -4794,10 +5154,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         )
         self.settings_data["strict_prompt_formatting"] = bool(self.settings_strict_format_var.get())
         save_settings(self.settings_data)
+        self.update_inference_backend_status()
         self.status_var.set(
             "Settings saved. Prompt profile: "
             f"{self.settings_data['chat_style']} / {self.settings_data['response_depth']} "
-            f"with {self.settings_data['chat_font_size']} px chat text."
+            f"with {self.settings_data['chat_font_size']} px chat text. "
+            f"Inference: {self.settings_data['inference_backend']}."
         )
 
     def change_password_action(self) -> None:
@@ -4864,6 +5226,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             if messagebox:
                 messagebox.showinfo("Task running", "Please wait for the current task to finish before closing the studio.")
             return
+        self.closing = True
         cleanup_worker_artifacts(remove_worker_caches=True)
         self.destroy()
 

@@ -92,6 +92,7 @@ STREAM_MAGIC = b"HGGM2"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 HISTORY_PAGE_SIZE = 12
+CHAT_TOOLBAR_STATE_KEY = "chat_toolbar_visible"
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 LATEX_COMMAND_REPLACEMENTS = {
@@ -648,6 +649,12 @@ def _ensure_plaintext_db_schema(db: sqlite3.Connection) -> None:
         "response TEXT, "
         "session_id INTEGER)"
     )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS app_state ("
+        "name TEXT PRIMARY KEY, "
+        "value TEXT, "
+        "updated_at TEXT)"
+    )
     columns = {row[1] for row in db.execute("PRAGMA table_info(history)").fetchall()}
     if "session_id" not in columns:
         db.execute("ALTER TABLE history ADD COLUMN session_id INTEGER")
@@ -880,6 +887,44 @@ def count_history_rows(key: bytes, search: Optional[str] = None) -> int:
             else:
                 row = db.execute("SELECT COUNT(*) FROM history").fetchone()
             return int(row[0] if row else 0)
+
+
+def fetch_app_state_value(key: bytes, name: str, default: str = "") -> str:
+    clean_name = sanitize_text(name, max_chars=120).strip()
+    if not clean_name:
+        return default
+    with unlocked_db_path(key) as temp_db:
+        with sqlite3.connect(temp_db) as db:
+            row = db.execute("SELECT value FROM app_state WHERE name = ?", (clean_name,)).fetchone()
+    if row is None or row[0] is None:
+        return default
+    return sanitize_text(row[0], max_chars=4000)
+
+
+def save_app_state_value(key: bytes, name: str, value: str) -> None:
+    clean_name = sanitize_text(name, max_chars=120).strip()
+    if not clean_name:
+        raise ValueError("Encrypted app state keys cannot be blank.")
+    clean_value = sanitize_text(value, max_chars=4000)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with unlocked_db_path(key) as temp_db:
+        with sqlite3.connect(temp_db) as db:
+            db.execute(
+                "INSERT OR REPLACE INTO app_state (name, value, updated_at) VALUES (?, ?, ?)",
+                (clean_name, clean_value, timestamp),
+            )
+            db.commit()
+
+
+def fetch_app_state_bool(key: bytes, name: str, default: bool = False) -> bool:
+    raw_value = fetch_app_state_value(key, name, default="")
+    if raw_value == "":
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def save_app_state_bool(key: bytes, name: str, value: bool) -> None:
+    save_app_state_value(key, name, "1" if value else "0")
 
 
 def fetch_history_page(
@@ -2364,6 +2409,7 @@ class HumoidStudioApp(AppBase):
         self.set_action_state(True)
         try:
             init_db(key)
+            self.load_chat_toolbar_state()
         except Exception as exc:
             self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}")
         self.refresh_dashboard()
@@ -3287,7 +3333,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             text_color=PALETTE["muted"],
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        self.chat_toolbar_visible = True
+        self.chat_toolbar_visible = False
         compact_toolbar = ctk.CTkFrame(left, fg_color="transparent")
         compact_toolbar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
         compact_toolbar.grid_columnconfigure(0, weight=1)
@@ -3301,7 +3347,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
 
         self.chat_toolbar_toggle_button = self.make_button(
             compact_buttons,
-            "Hide Tools",
+            "Show Tools",
             self.toggle_chat_toolbar,
             4,
             width=104,
@@ -3313,6 +3359,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         toolbar = ctk.CTkFrame(left, fg_color=PALETTE["card_soft"], corner_radius=18, border_width=1, border_color=PALETTE["line"])
         self.chat_toolbar = toolbar
         toolbar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        toolbar.grid_remove()
         for column_index in (0, 1, 2):
             toolbar.grid_columnconfigure(column_index, weight=1)
 
@@ -3481,12 +3528,34 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.register_action(hide_memory_button)
 
     def toggle_chat_toolbar(self) -> None:
-        if getattr(self, "chat_toolbar_visible", True):
+        if getattr(self, "chat_toolbar_visible", False):
             self.hide_chat_toolbar()
         else:
             self.show_chat_toolbar()
 
-    def show_chat_toolbar(self) -> None:
+    def load_chat_toolbar_state(self) -> None:
+        if self.key is None:
+            self.hide_chat_toolbar(persist=False)
+            return
+        try:
+            visible = fetch_app_state_bool(self.key, CHAT_TOOLBAR_STATE_KEY, default=False)
+        except Exception as exc:
+            self.status_var.set(f"Toolbar preference unavailable; using compact chat controls: {exc}")
+            visible = False
+        if visible:
+            self.show_chat_toolbar(persist=False)
+        else:
+            self.hide_chat_toolbar(persist=False)
+
+    def save_chat_toolbar_state(self) -> None:
+        if self.key is None:
+            return
+        try:
+            save_app_state_bool(self.key, CHAT_TOOLBAR_STATE_KEY, bool(getattr(self, "chat_toolbar_visible", False)))
+        except Exception as exc:
+            self.status_var.set(f"Toolbar preference could not be saved: {exc}")
+
+    def show_chat_toolbar(self, *, persist: bool = True) -> None:
         if not hasattr(self, "chat_toolbar"):
             return
         self.chat_toolbar_visible = True
@@ -3495,8 +3564,10 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.chat_toolbar_toggle_button.configure(text="Hide Tools")
         except Exception:
             pass
+        if persist:
+            self.save_chat_toolbar_state()
 
-    def hide_chat_toolbar(self) -> None:
+    def hide_chat_toolbar(self, *, persist: bool = True) -> None:
         if not hasattr(self, "chat_toolbar"):
             return
         self.chat_toolbar_visible = False
@@ -3505,6 +3576,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.chat_toolbar_toggle_button.configure(text="Show Tools")
         except Exception:
             pass
+        if persist:
+            self.save_chat_toolbar_state()
 
     def toggle_memory_panel(self) -> None:
         if getattr(self, "memory_panel_visible", False):
@@ -5215,6 +5288,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.status_var.set("Studio locked.")
         self.hash_status_var.set("Hash: Not checked")
         self.chat_memory.clear()
+        self.hide_chat_toolbar(persist=False)
         self.refresh_memory_preview()
         self.render_recent_session_tabs([])
         self.reset_qid_display()

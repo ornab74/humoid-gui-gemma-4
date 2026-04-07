@@ -119,7 +119,7 @@ TIE_DYE = [
     ("#00d46a", "#00b85c"),
     ("#1ecf7a", "#14b066"),
     ("#68ff9a", "#4be783"),
-    ("#2b3830", "#1e2a22"),
+    ("#a6ffbf", "#82efa5"),
     ("#94ffb8", "#75e69a"),
 ]
 
@@ -1434,6 +1434,7 @@ class HumoidStudioApp(AppBase):
         self.road_tab = self.tabview.add("Road Scanner")
         self.history_tab = self.tabview.add("History")
         self.settings_tab = self.tabview.add("Settings")
+        self.about_tab = self.tabview.add("About")
 
         for tab in (
             self.dashboard_tab,
@@ -1442,6 +1443,7 @@ class HumoidStudioApp(AppBase):
             self.road_tab,
             self.history_tab,
             self.settings_tab,
+            self.about_tab,
         ):
             tab.grid_columnconfigure(0, weight=1)
 
@@ -1451,6 +1453,7 @@ class HumoidStudioApp(AppBase):
         self.build_road_tab()
         self.build_history_tab()
         self.build_settings_tab()
+        self.build_about_tab()
         self.set_action_state(False)
 
     def draw_background(self, _event: Optional[Any] = None) -> None:
@@ -1471,7 +1474,7 @@ class HumoidStudioApp(AppBase):
             parent,
             textvariable=variable,
             font=self.small_font,
-            text_color=PALETTE["text"],
+            text_color="#031009",
             fg_color=color,
             corner_radius=16,
             padx=12,
@@ -1722,6 +1725,9 @@ class HumoidStudioApp(AppBase):
             side="left", padx=(0, 10)
         )
         self.register_action(self.make_button(buttons, "Road Scanner", lambda: self.tabview.set("Road Scanner"), 4)).pack(
+            side="left", padx=(0, 10)
+        )
+        self.register_action(self.make_button(buttons, "About", lambda: self.tabview.set("About"), 5, width=130)).pack(
             side="left"
         )
 
@@ -1745,30 +1751,151 @@ class HumoidStudioApp(AppBase):
                 anchor="w", padx=20, pady=(0, 18)
             )
 
-        mood = ctk.CTkFrame(
+    def build_about_tab(self) -> None:
+        tab = self.about_tab
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(
             tab,
-            fg_color=PALETTE["card_soft"],
-            corner_radius=22,
+            fg_color=PALETTE["card"],
+            corner_radius=24,
             border_width=1,
             border_color=PALETTE["line"],
         )
-        mood.grid(row=2, column=0, columnspan=3, sticky="nsew", padx=20, pady=(0, 20))
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 14))
+        header.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(mood, text="Studio Mood", font=self.section_font, text_color=PALETTE["text"]).pack(
-            anchor="w", padx=22, pady=(18, 8)
-        )
         ctk.CTkLabel(
-            mood,
+            header,
+            text="About Humoid Gemma Studio",
+            font=self.section_font,
+            text_color=PALETTE["text"],
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(18, 6))
+
+        ctk.CTkLabel(
+            header,
             text=(
-                "Tie-dye bright buttons, a warm glassy background, and a passphrase-first startup flow. "
-                "Heavy work stays off the UI thread so the interface keeps breathing while downloads, "
-                "hash checks, and inference jobs run."
+                "Three ways to understand the same app: a friendly overview, a programmer map, "
+                "and a deeper systems-level walkthrough."
             ),
             font=self.body_font,
             text_color=PALETTE["muted"],
             justify="left",
-            wraplength=1180,
-        ).pack(anchor="w", padx=22, pady=(0, 20))
+            wraplength=1100,
+        ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 18))
+
+        about_modes = ctk.CTkTabview(
+            tab,
+            fg_color=PALETTE["card"],
+            corner_radius=24,
+            border_width=1,
+            border_color=PALETTE["line"],
+            segmented_button_fg_color=PALETTE["panel_alt"],
+            segmented_button_selected_color=PALETTE["accent_teal"],
+            segmented_button_selected_hover_color="#00b85c",
+            segmented_button_unselected_color="#18231b",
+            segmented_button_unselected_hover_color="#223128",
+            text_color=PALETTE["text"],
+        )
+        about_modes.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+
+        sections = {
+            "Beginner": """
+# Beginner Mode
+
+Humoid Gemma Studio is a local AI control room.
+
+- **Chat** is where you talk to the Gemma model.
+- **Model Lab** downloads, checks, encrypts, and verifies the model file.
+- **Road Scanner** turns road conditions into a Low, Medium, or High risk label.
+- **History** shows old prompts and replies from the encrypted history vault.
+- **Settings** controls memory, password rotation, image input, and TTS.
+
+## How The Vault Works
+
+When the app opens, it asks for your vault password. That password unlocks the encrypted model and encrypted chat history. The app only unlocks files when it needs them, then cleans up temporary runtime files afterward.
+
+## Why The UI Stays Responsive
+
+Downloads, model generation, road scans, and text-to-speech run away from the main GUI thread. That keeps buttons, tabs, and progress indicators from freezing as much as possible while heavy work is happening.
+""",
+            "Programmer": """
+# Programmer Mode
+
+The app is split into a few practical layers inside `main.py`.
+
+- **Crypto/storage functions** handle key derivation, AES-GCM encryption, model vault files, and encrypted SQLite history.
+- **LiteRT functions** load the model, create conversations, pass text/image prompts, and return model text.
+- **Worker process plumbing** runs inference outside Tk so native LiteRT work does not block the GUI event loop.
+- **CustomTkinter UI methods** build the Dashboard, Chat, Model Lab, Road Scanner, History, Settings, and About tabs.
+
+## Important Flow
+
+1. The startup dialog derives a key from the vault password.
+2. The app initializes or decrypts the encrypted history DB only when needed.
+3. Chat submits a sanitized prompt plus recent memory to a background worker process.
+4. The worker decrypts a temporary model runtime copy, runs LiteRT-LM, logs the result, and removes temporary files.
+5. The GUI receives the result through a queue and renders it safely.
+
+## Markdown And Safety
+
+Output text is sanitized with `bleach` when available, then rendered into Tk text tags. The renderer supports headings, code blocks, inline code, links, blockquotes, lists, and horizontal rules without embedding HTML.
+""",
+            "Superprogrammer": """
+# Superprogrammer Mode
+
+This app is a local-first encrypted orchestration shell around LiteRT-LM.
+
+## Security Boundaries
+
+- The vault password is never sent to the model.
+- Key derivation uses PBKDF2-HMAC-SHA256 with a stored salt.
+- Model and history assets are sealed with AES-GCM.
+- The encrypted model is treated as the source of truth; runtime model copies are temporary.
+- Image input is validated by path, symlink status, size, extension, and magic bytes before it can reach the model path.
+- History logs image filenames and metadata, not raw image bytes.
+
+## Concurrency Model
+
+Tk owns the UI thread. Native generation runs in a spawned worker process so a LiteRT segfault cannot take down the GUI process directly. The parent watches a multiprocessing queue, reports success/error back through Tk's queue polling, and cleans stale worker caches plus temporary runtime artifacts.
+
+## Model Path
+
+The current configured model is:
+
+```text
+gemma-4-E2B-it.litertlm
+```
+
+For native image prompts, the engine path enables:
+
+```python
+vision_backend=litert_lm.Backend.CPU
+```
+
+If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault intact and surfaces the worker crash instead of silently corrupting model or history state.
+""",
+        }
+
+        for title, content in sections.items():
+            mode_tab = about_modes.add(title)
+            mode_tab.grid_columnconfigure(0, weight=1)
+            mode_tab.grid_rowconfigure(0, weight=1)
+            box = ctk.CTkTextbox(
+                mode_tab,
+                fg_color=PALETTE["panel_alt"],
+                text_color=PALETTE["text"],
+                corner_radius=20,
+                border_width=1,
+                border_color=PALETTE["line"],
+                font=self.body_font,
+                wrap="word",
+            )
+            box.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+            self.configure_textbox_tags(box)
+            self.insert_markdown_text(box, content.strip(), max_chars=12000)
+            box.configure(state="disabled")
 
     def build_chat_tab(self) -> None:
         tab = self.chat_tab

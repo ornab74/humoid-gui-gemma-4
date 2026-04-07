@@ -91,6 +91,48 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 HISTORY_PAGE_SIZE = 12
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+LATEX_COMMAND_REPLACEMENTS = {
+    r"\alpha": "α",
+    r"\beta": "β",
+    r"\gamma": "γ",
+    r"\delta": "δ",
+    r"\epsilon": "ε",
+    r"\eta": "η",
+    r"\theta": "θ",
+    r"\kappa": "κ",
+    r"\lambda": "λ",
+    r"\mu": "μ",
+    r"\rho": "ρ",
+    r"\pi": "π",
+    r"\sigma": "σ",
+    r"\tau": "τ",
+    r"\phi": "φ",
+    r"\omega": "ω",
+    r"\Delta": "Δ",
+    r"\Omega": "Ω",
+    r"\partial": "∂",
+    r"\nabla": "∇",
+    r"\times": "×",
+    r"\cdot": "·",
+    r"\div": "÷",
+    r"\pm": "±",
+    r"\leq": "≤",
+    r"\geq": "≥",
+    r"\neq": "≠",
+    r"\equiv": "≡",
+    r"\approx": "≈",
+    r"\propto": "∝",
+    r"\infty": "∞",
+    r"\sum": "Σ",
+    r"\prod": "Π",
+    r"\int": "∫",
+    r"\rightarrow": "→",
+    r"\leftarrow": "←",
+    r"\Rightarrow": "⇒",
+    r"\Leftarrow": "⇐",
+}
+SUPERSCRIPT_TRANS = str.maketrans("0123456789+-=()nixy", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱˣʸ")
+SUBSCRIPT_TRANS = str.maketrans("0123456789+-=()nixy", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₙᵢₓᵧ")
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -143,6 +185,7 @@ DEFAULT_SETTINGS = {
     "include_system_entropy": True,
     "delete_plaintext_after_encrypt": True,
     "chat_memory_turns": 6,
+    "chat_font_size": 13,
     "enable_native_image_input": True,
     "chat_style": "Balanced",
     "response_depth": "Normal",
@@ -217,6 +260,39 @@ def render_markdown_for_display(value: Any, *, max_chars: int = 20000) -> str:
     if in_code_block:
         rendered.append("--- end code ---")
     return "\n".join(rendered).strip()
+
+
+def render_latex_for_display(value: Any) -> str:
+    text = sanitize_text(value, max_chars=4000).strip()
+
+    def replace_fraction(match: re.Match[str]) -> str:
+        return f"({match.group(1)})/({match.group(2)})"
+
+    def replace_sqrt(match: re.Match[str]) -> str:
+        return f"√({match.group(1)})"
+
+    text = re.sub(r"\\begin\{[^{}]+\}|\\end\{[^{}]+\}", "", text)
+    text = text.replace(r"\\", "\n")
+    text = text.replace("&", "")
+    text = re.sub(r"\\(?:mathrm|mathbf|mathit|text|boxed)\{([^{}]+)\}", r"\1", text)
+    text = re.sub(r"\\mathbb\{R\}", "ℝ", text)
+    text = re.sub(r"\\mathbb\{N\}", "ℕ", text)
+    text = re.sub(r"\\mathbb\{Z\}", "ℤ", text)
+    text = re.sub(r"\\mathbb\{Q\}", "ℚ", text)
+    text = re.sub(r"\\mathbb\{C\}", "ℂ", text)
+    text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", replace_fraction, text)
+    text = re.sub(r"\\sqrt\{([^{}]+)\}", replace_sqrt, text)
+    for command, replacement in LATEX_COMMAND_REPLACEMENTS.items():
+        text = text.replace(command, replacement)
+    text = re.sub(r"\^\{([0-9+\-=()nixy]+)\}", lambda match: match.group(1).translate(SUPERSCRIPT_TRANS), text)
+    text = re.sub(r"_\{([0-9+\-=()nixy]+)\}", lambda match: match.group(1).translate(SUBSCRIPT_TRANS), text)
+    text = re.sub(r"\^([0-9+\-=()nixy])", lambda match: match.group(1).translate(SUPERSCRIPT_TRANS), text)
+    text = re.sub(r"_([0-9+\-=()nixy])", lambda match: match.group(1).translate(SUBSCRIPT_TRANS), text)
+    text = text.replace(r"\left", "").replace(r"\right", "")
+    text = text.replace("{", "").replace("}", "")
+    text = "\n".join(re.sub(r"\s+", " ", line).strip() for line in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def validate_image_path(image_path: str | Path) -> Path:
@@ -557,23 +633,65 @@ def fetch_recent_sessions(key: bytes, limit: int = 6) -> List[Dict[str, Any]]:
     with unlocked_db_path(key) as temp_db:
         with sqlite3.connect(temp_db) as db:
             cursor = db.execute(
-                "SELECT s.id, s.started_at, s.updated_at, s.title, COUNT(h.id) AS turns "
-                "FROM sessions s LEFT JOIN history h ON h.session_id = s.id "
+                "SELECT s.id, "
+                "COALESCE((SELECT h2.timestamp FROM history h2 WHERE h2.session_id = s.id ORDER BY h2.id ASC LIMIT 1), s.started_at, ''), "
+                "COALESCE((SELECT h3.timestamp FROM history h3 WHERE h3.session_id = s.id ORDER BY h3.id DESC LIMIT 1), s.updated_at, ''), "
+                "(SELECT h2.prompt FROM history h2 WHERE h2.session_id = s.id ORDER BY h2.id ASC LIMIT 1), "
+                "(SELECT h3.prompt FROM history h3 WHERE h3.session_id = s.id ORDER BY h3.id DESC LIMIT 1), "
+                "COUNT(h.id) AS turns "
+                "FROM sessions s JOIN history h ON h.session_id = s.id "
                 "GROUP BY s.id "
-                "ORDER BY COALESCE(s.updated_at, s.started_at) DESC "
+                "ORDER BY MAX(h.id) DESC "
                 "LIMIT ?",
                 (limit,),
             )
-            return [
-                {
-                    "id": int(row[0]),
-                    "started_at": row[1] or "",
-                    "updated_at": row[2] or "",
-                    "title": row[3] or "Untitled session",
-                    "turns": int(row[4] or 0),
-                }
-                for row in cursor.fetchall()
-            ]
+            sessions: List[Dict[str, Any]] = []
+            for row in cursor.fetchall():
+                first_prompt = " ".join(sanitize_text(row[3] or "", max_chars=700).split())
+                latest_prompt = " ".join(sanitize_text(row[4] or "", max_chars=900).split())
+                title = first_prompt[:70].rstrip() or "Local chat"
+                sessions.append(
+                    {
+                        "id": int(row[0]),
+                        "started_at": row[1] or "",
+                        "updated_at": row[2] or "",
+                        "title": title,
+                        "first_prompt": first_prompt,
+                        "latest_prompt": latest_prompt,
+                        "turns": int(row[5] or 0),
+                    }
+                )
+            return sessions
+
+
+def fetch_history_index_entries(key: bytes, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    with unlocked_db_path(key) as temp_db:
+        with sqlite3.connect(temp_db) as db:
+            limit_clause = "" if limit is None or limit <= 0 else " LIMIT ?"
+            params: Tuple[int, ...] = () if limit is None or limit <= 0 else (limit,)
+            cursor = db.execute(
+                "SELECT s.id, "
+                "COALESCE((SELECT h2.timestamp FROM history h2 WHERE h2.session_id = s.id ORDER BY h2.id ASC LIMIT 1), s.started_at, ''), "
+                "(SELECT h2.prompt FROM history h2 WHERE h2.session_id = s.id ORDER BY h2.id ASC LIMIT 1), "
+                "COUNT(h.id) AS turns "
+                "FROM sessions s JOIN history h ON h.session_id = s.id "
+                "GROUP BY s.id "
+                "ORDER BY MAX(h.id) DESC "
+                + limit_clause,
+                params,
+            )
+            entries: List[Dict[str, Any]] = []
+            for row in cursor.fetchall():
+                prompt = " ".join(sanitize_text(row[2] or "", max_chars=500).split())
+                entries.append(
+                    {
+                        "id": int(row[0]),
+                        "timestamp": row[1] or "",
+                        "prompt": prompt or "Blank first prompt",
+                        "turns": int(row[3] or 0),
+                    }
+                )
+            return entries
 
 
 def fetch_session_chat_rows(key: bytes, session_id: int) -> Dict[str, Any]:
@@ -1017,7 +1135,7 @@ def unlocked_model_path(key: bytes):
         yield MODEL_PATH
         return
 
-    raise FileNotFoundError("No model is available yet. Download and encrypt it from the Model Lab tab first.")
+    raise FileNotFoundError("No model is available yet. Download and encrypt it from the Download Model tab first.")
 
 
 def build_chat_prompt(user_text: str, memory: List[Tuple[str, str]], turns: int = 6) -> str:
@@ -1068,6 +1186,7 @@ def build_chat_system_prompt(
                 "If the user asks for code only, output raw code only: no markdown fence, no intro, no outro.",
                 "If the user asks for markdown, write clean valid markdown with normal headings, lists, links, and fenced code blocks.",
                 "When writing code blocks in markdown, use triple backticks with a language label when helpful.",
+                "For equations, use standard Markdown math delimiters like $E=mc^2$ or $$\\frac{a}{b}$$ so the GUI can render them.",
                 "Avoid HTML and decorative junk that can render badly in a Tk text widget.",
             ]
         )
@@ -1119,25 +1238,6 @@ def run_chat_request(
         log_prompt = f"{model_prompt}\n[Image attached: {safe_image_path.name}]"
     log_interaction(log_prompt, sanitize_text(reply), key, session_id=session_id)
     return reply
-
-
-def run_session_title_request(key: bytes, prompt: str, reply: str) -> str:
-    title_prompt = (
-        "Create a short dashboard title for this chat session. Return only the title: no markdown, no quotes, "
-        "no prefix, no trailing period. Use 3 to 7 words and capture the real topic.\n\n"
-        f"User first message:\n{sanitize_text(prompt, max_chars=1800)}\n\n"
-        f"Assistant first reply:\n{sanitize_text(reply, max_chars=1800)}"
-    )
-    with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
-        raw_title = litert_chat_blocking(
-            model_path,
-            title_prompt,
-            system_text="You create concise conversation titles. Return only the title.",
-            cache_dir=cache_dir,
-        )
-    title = sanitize_text(raw_title, max_chars=120).strip().strip('"').strip("'")
-    title = re.sub(r"\s+", " ", title)
-    return title or "Local AI conversation"
 
 
 def run_qid_mood_request(key: bytes, qid: str, color: str, sessions: List[Dict[str, Any]]) -> str:
@@ -1404,7 +1504,7 @@ def describe_process_exit(task_name: str, task_args: Tuple[Any, ...], exit_code:
         )
     else:
         detail += (
-            "\n\nIf it happens again on text-only prompts, try Verify Hash in Model Lab or re-download the model; "
+            "\n\nIf it happens again on text-only prompts, try Verify Hash in Download Model or re-download the model; "
             "native segfaults usually point to runtime/model/cache issues rather than Python UI code."
         )
     return RuntimeError(detail)
@@ -1412,7 +1512,6 @@ def describe_process_exit(task_name: str, task_args: Tuple[Any, ...], exit_code:
 
 PROCESS_TASKS = {
     "chat_request": run_chat_request,
-    "session_title": run_session_title_request,
     "qid_mood": run_qid_mood_request,
     "road_scan": run_road_scan,
 }
@@ -1439,7 +1538,7 @@ class StartupPasswordDialog(DialogBase):
         self.confirm_var = tk.StringVar()
         self.error_var = tk.StringVar(value="")
 
-        self.title("Unlock Humoid Studio")
+        self.title("Unlock Humoids")
         self.geometry("560x520")
         self.minsize(560, 520)
         self.resizable(False, False)
@@ -1459,7 +1558,7 @@ class StartupPasswordDialog(DialogBase):
 
         ctk.CTkLabel(
             frame,
-            text="Humoid Gemma Studio",
+            text="Humoids",
             font=app.title_font,
             text_color=PALETTE["text"],
         ).pack(anchor="w", padx=28, pady=(24, 6))
@@ -1646,6 +1745,7 @@ class StartupPasswordDialog(DialogBase):
 
         if self.mode == "missing":
             key = create_passphrase_key(password)
+            self.app.offer_model_download_after_unlock = True
             self.app.complete_unlock(key, "passphrase")
             self.destroy()
             return
@@ -1720,6 +1820,10 @@ class HumoidStudioApp(AppBase):
         self.current_qid_info: Dict[str, str] = {}
         self.current_qid_sessions: List[Dict[str, Any]] = []
         self.qid_mood_requested_signature = ""
+        self.offer_model_download_after_unlock = False
+        self.history_index_visible = False
+        self.history_index_loading = False
+        self.history_index_render_after_id: Optional[str] = None
         self.history_search_var = tk.StringVar()
         self.history_status_var = tk.StringVar(value="Unlock the vault to search history.")
         self.settings_entropy_var = tk.BooleanVar(value=bool(self.settings_data.get("include_system_entropy", True)))
@@ -1727,6 +1831,13 @@ class HumoidStudioApp(AppBase):
             value=bool(self.settings_data.get("delete_plaintext_after_encrypt", True))
         )
         self.settings_memory_turns_var = tk.IntVar(value=int(self.settings_data.get("chat_memory_turns", 6)))
+        try:
+            chat_font_size_setting = int(self.settings_data.get("chat_font_size", 13))
+        except Exception:
+            chat_font_size_setting = 13
+        self.settings_chat_font_size_var = tk.IntVar(value=max(10, min(22, chat_font_size_setting)))
+        self.chat_font_size_label_var = tk.StringVar()
+        self.chat_input_stats_var = tk.StringVar(value="0 chars | 0 lines | Shift+Enter for newline")
         self.settings_native_image_var = tk.BooleanVar(value=bool(self.settings_data.get("enable_native_image_input", False)))
         self.settings_chat_style_var = tk.StringVar(
             value=normalize_setting_choice(self.settings_data.get("chat_style"), CHAT_STYLE_OPTIONS, "Balanced")
@@ -1737,11 +1848,12 @@ class HumoidStudioApp(AppBase):
         self.settings_strict_format_var = tk.BooleanVar(
             value=bool(self.settings_data.get("strict_prompt_formatting", True))
         )
+        self.update_chat_font_label()
         self.change_current_password_var = tk.StringVar()
         self.change_new_password_var = tk.StringVar()
         self.change_confirm_password_var = tk.StringVar()
 
-        self.title("Humoid Gemma 4")
+        self.title("Humoids")
         self.geometry("1420x940")
         self.minsize(1260, 860)
         self.configure(fg_color=PALETTE["window"])
@@ -1783,7 +1895,7 @@ class HumoidStudioApp(AppBase):
 
         ctk.CTkLabel(
             left,
-            text="Humoid Gemma Studio",
+            text="Humoids",
             font=self.title_font,
             text_color=PALETTE["text"],
         ).pack(anchor="w")
@@ -1844,18 +1956,18 @@ class HumoidStudioApp(AppBase):
 
         self.dashboard_tab = self.tabview.add("Dashboard")
         self.chat_tab = self.tabview.add("Chat")
-        self.model_tab = self.tabview.add("Model Lab")
         self.road_tab = self.tabview.add("Road Scanner")
         self.history_tab = self.tabview.add("History")
+        self.model_tab = self.tabview.add("Download Model")
         self.settings_tab = self.tabview.add("Settings")
         self.about_tab = self.tabview.add("About")
 
         for tab in (
             self.dashboard_tab,
             self.chat_tab,
-            self.model_tab,
             self.road_tab,
             self.history_tab,
+            self.model_tab,
             self.settings_tab,
             self.about_tab,
         ):
@@ -1916,21 +2028,43 @@ class HumoidStudioApp(AppBase):
             fg_color=fg_color,
             hover_color=hover_color,
             text_color="#041308",
+            text_color_disabled="#ecfff2",
             border_width=1,
             border_color="#7cf7aa",
             font=ctk.CTkFont(family="DejaVu Sans", size=13, weight="bold"),
         )
+        button._humoid_enabled_fg_color = fg_color
+        button._humoid_enabled_hover_color = hover_color
+        button._humoid_enabled_text_color = "#041308"
         return button
 
-    def register_action(self, widget: Any) -> Any:
+    def register_action(self, widget: Any, *, allow_during_busy: bool = False) -> Any:
         self.action_widgets.append(widget)
+        if allow_during_busy:
+            setattr(widget, "_humoid_allow_during_busy", True)
         return widget
 
     def set_action_state(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         for widget in self.action_widgets:
             try:
-                widget.configure(state=state)
+                widget_state = "normal" if state == "normal" or (
+                    self.busy and self.key is not None and getattr(widget, "_humoid_allow_during_busy", False)
+                ) else "disabled"
+                if hasattr(widget, "_humoid_enabled_fg_color"):
+                    if widget_state == "disabled":
+                        widget.configure(
+                            fg_color="#2c3931",
+                            hover_color="#2c3931",
+                            text_color_disabled="#ecfff2",
+                        )
+                    else:
+                        widget.configure(
+                            fg_color=getattr(widget, "_humoid_enabled_fg_color", PALETTE["accent_orange"]),
+                            hover_color=getattr(widget, "_humoid_enabled_hover_color", PALETTE["accent_gold"]),
+                            text_color=getattr(widget, "_humoid_enabled_text_color", "#041308"),
+                        )
+                widget.configure(state=widget_state)
             except Exception:
                 pass
 
@@ -1969,6 +2103,7 @@ class HumoidStudioApp(AppBase):
             self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}")
         self.refresh_dashboard()
         self.after(700, self.request_qid_mood_generation)
+        self.after(900, self.offer_first_model_download)
         self.after(150, self.refresh_history_action)
 
     def ensure_unlocked(self) -> bool:
@@ -1978,6 +2113,20 @@ class HumoidStudioApp(AppBase):
         if messagebox:
             messagebox.showinfo("Vault Locked", "Unlock the studio before running model or history actions.")
         return False
+
+    def offer_first_model_download(self) -> None:
+        if not self.offer_model_download_after_unlock:
+            return
+        self.offer_model_download_after_unlock = False
+        if self.key is None or ENCRYPTED_MODEL.exists() or MODEL_PATH.exists():
+            return
+        self.tabview.set("Download Model")
+        self.status_var.set("Vault created. Next step: download and encrypt the local Gemma model.")
+        if messagebox and messagebox.askyesno(
+            "Download local model?",
+            "Your encrypted vault is ready. The next normal setup step is downloading and encrypting the Gemma model. Start now?",
+        ):
+            self.download_model_action(confirm=False)
 
     def reset_qid_display(self) -> None:
         self.current_qid_info = {}
@@ -2068,6 +2217,53 @@ class HumoidStudioApp(AppBase):
         g = int(color[3:5], 16)
         b = int(color[5:7], 16)
         return (0.299 * r) + (0.587 * g) + (0.114 * b)
+
+    def chat_font_size(self) -> int:
+        try:
+            value = int(self.settings_chat_font_size_var.get())
+        except Exception:
+            try:
+                value = int(self.settings_data.get("chat_font_size", 13))
+            except Exception:
+                value = 13
+        return max(10, min(22, value))
+
+    def update_chat_font_label(self) -> None:
+        try:
+            self.chat_font_size_label_var.set(f"Chatbox font size: {self.chat_font_size()} px")
+        except Exception:
+            pass
+
+    def apply_chat_font_size(self, _value: Optional[float] = None) -> None:
+        size = self.chat_font_size()
+        self.update_chat_font_label()
+        if hasattr(self, "chat_input"):
+            try:
+                self.chat_input.configure(font=ctk.CTkFont(family="DejaVu Sans", size=size))
+            except Exception:
+                pass
+        if hasattr(self, "chat_output"):
+            self.configure_textbox_tags(self.chat_output, base_size=size)
+
+    def update_chat_input_stats(self, _event: Optional[Any] = None) -> None:
+        if not hasattr(self, "chat_input"):
+            return
+        try:
+            text = self.chat_input.get("1.0", "end-1c")
+        except Exception:
+            text = ""
+        line_count = text.count("\n") + 1 if text else 0
+        word_count = len(re.findall(r"\S+", text))
+        self.chat_input_stats_var.set(
+            f"{len(text)} chars | {word_count} words | {line_count} lines | Shift+Enter for newline"
+        )
+
+    def clear_chat_input(self) -> None:
+        if not hasattr(self, "chat_input"):
+            return
+        self.chat_input.delete("1.0", "end")
+        self.update_chat_input_stats()
+        self.status_var.set("Prompt box cleared.")
 
     def run_task(
         self,
@@ -2181,6 +2377,25 @@ class HumoidStudioApp(AppBase):
                     elif self.status_var.get() == "":
                         self.status_var.set("Task completed.")
 
+                elif kind == "success_no_refresh":
+                    _, result, callback = event
+                    self.set_busy(False)
+                    if callback:
+                        callback(result)
+                    elif self.status_var.get() == "":
+                        self.status_var.set("Task completed.")
+
+                elif kind == "history_index_success":
+                    _, entries = event
+                    self.history_index_loading = False
+                    self.render_chat_history_index(entries)
+
+                elif kind == "history_index_error":
+                    _, exc = event
+                    self.history_index_loading = False
+                    self.render_chat_history_index([])
+                    self.status_var.set(f"History index unavailable: {sanitize_text(exc, max_chars=140)}")
+
                 elif kind == "error":
                     _, exc, callback = event
                     self.set_busy(False)
@@ -2191,8 +2406,10 @@ class HumoidStudioApp(AppBase):
                         self.status_var.set(str(exc))
                         if messagebox:
                             messagebox.showerror("Task failed", str(exc))
-        except Exception:
+        except queue.Empty:
             pass
+        except Exception as exc:
+            self.status_var.set(f"UI queue issue: {sanitize_text(exc, max_chars=140)}")
 
         self.after(120, self.process_task_queue)
 
@@ -2373,7 +2590,7 @@ class HumoidStudioApp(AppBase):
             self.dashboard_recent_tabs.append(tab_name)
             ctk.CTkLabel(
                 tab,
-                text="No summarized chat sessions yet.\nSend a chat message and Gemma will title the session after the first reply.",
+                text="No saved chat sessions yet.\nSend a chat message and it will appear here from encrypted history.",
                 font=self.body_font,
                 text_color=PALETTE["muted"],
                 justify="left",
@@ -2390,7 +2607,12 @@ class HumoidStudioApp(AppBase):
             while tab_name in self.dashboard_recent_tabs:
                 tab_name += "+"
             tab = self.recent_sessions_tabview.add(tab_name)
+            tab.grid_columnconfigure(0, weight=1)
             self.dashboard_recent_tabs.append(tab_name)
+
+            latest_prompt = sanitize_text(session.get("latest_prompt", ""), max_chars=900).replace("\n", " ").strip()
+            first_prompt = sanitize_text(session.get("first_prompt", ""), max_chars=700).replace("\n", " ").strip()
+            preview = latest_prompt or first_prompt or "No prompt preview saved for this session."
 
             ctk.CTkLabel(
                 tab,
@@ -2413,6 +2635,29 @@ class HumoidStudioApp(AppBase):
                 text_color=PALETTE["muted"],
                 justify="left",
             ).pack(anchor="w", padx=18, pady=(0, 14))
+
+            preview_card = ctk.CTkFrame(
+                tab,
+                fg_color=PALETTE["card_soft"],
+                corner_radius=18,
+                border_width=1,
+                border_color=PALETTE["line"],
+            )
+            preview_card.pack(anchor="w", fill="x", padx=18, pady=(0, 16))
+            ctk.CTkLabel(
+                preview_card,
+                text="Latest prompt",
+                font=self.small_font,
+                text_color=PALETTE["accent_gold"],
+            ).pack(anchor="w", padx=14, pady=(12, 4))
+            ctk.CTkLabel(
+                preview_card,
+                text=preview,
+                font=self.body_font,
+                text_color=PALETTE["text"],
+                justify="left",
+                wraplength=720,
+            ).pack(anchor="w", fill="x", padx=14, pady=(0, 14))
 
             actions = ctk.CTkFrame(tab, fg_color="transparent")
             actions.pack(anchor="w", padx=18, pady=(0, 18))
@@ -2469,9 +2714,13 @@ class HumoidStudioApp(AppBase):
                 clean_prompt = sanitize_text(prompt, max_chars=12000)
                 clean_response = sanitize_text(response, max_chars=16000)
                 self.chat_memory.extend([("user", clean_prompt), ("assistant", clean_response)])
-                self.chat_output._textbox.insert("end", f"You  {clean_stamp}\n", ("user_header",))
+                self.chat_output._textbox.insert("end", f"You  {clean_stamp} ", ("user_header",))
+                self.insert_copy_button(self.chat_output, self.chat_output._textbox, clean_prompt, "Copy")
+                self.chat_output._textbox.insert("end", "\n")
                 self.insert_markdown_text(self.chat_output, clean_prompt)
-                self.chat_output._textbox.insert("end", f"\nGemma  {clean_stamp}\n", ("assistant_header",))
+                self.chat_output._textbox.insert("end", f"\nGemma  {clean_stamp} ", ("assistant_header",))
+                self.insert_copy_button(self.chat_output, self.chat_output._textbox, clean_response, "Copy")
+                self.chat_output._textbox.insert("end", "\n")
                 self.insert_markdown_text(self.chat_output, clean_response)
                 self.chat_output._textbox.insert("end", "\n")
             self.chat_output._textbox.see("end")
@@ -2512,7 +2761,7 @@ class HumoidStudioApp(AppBase):
 
         ctk.CTkLabel(
             header,
-            text="About Humoid Gemma Studio",
+            text="About Humoids",
             font=self.section_font,
             text_color=PALETTE["text"],
         ).grid(row=0, column=0, sticky="w", padx=22, pady=(18, 6))
@@ -2548,10 +2797,10 @@ class HumoidStudioApp(AppBase):
             "Beginner": """
 # Beginner Mode
 
-Humoid Gemma Studio is a local AI control room.
+Humoids is a local AI control room.
 
 - **Chat** is where you talk to the Gemma model.
-- **Model Lab** downloads, checks, encrypts, and verifies the model file.
+- **Download Model** downloads, checks, encrypts, and verifies the model file.
 - **Road Scanner** turns road conditions into a Low, Medium, or High risk label.
 - **History** shows old prompts and replies from the encrypted history vault.
 - **Settings** controls memory, password rotation, image input, and TTS.
@@ -2572,7 +2821,7 @@ The app is split into a few practical layers inside `main.py`.
 - **Crypto/storage functions** handle key derivation, AES-GCM encryption, model vault files, and encrypted SQLite history.
 - **LiteRT functions** load the model, create conversations, pass text/image prompts, and return model text.
 - **Worker process plumbing** runs inference outside Tk so native LiteRT work does not block the GUI event loop.
-- **CustomTkinter UI methods** build the Dashboard, Chat, Model Lab, Road Scanner, History, Settings, and About tabs.
+- **CustomTkinter UI methods** build the Dashboard, Chat, Road Scanner, History, Download Model, Settings, and About tabs.
 
 ## Important Flow
 
@@ -2643,24 +2892,58 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
 
     def build_chat_tab(self) -> None:
         tab = self.chat_tab
-        tab.grid_columnconfigure(0, weight=4)
-        tab.grid_columnconfigure(1, weight=2)
+        tab.grid_columnconfigure(0, weight=0)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_columnconfigure(2, weight=0)
         tab.grid_rowconfigure(0, weight=1)
 
+        self.memory_panel_visible = False
+        self.history_index_visible = False
+
+        history_index = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
+        self.history_index_panel = history_index
+        history_index.grid_columnconfigure(0, weight=1)
+        history_index.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            history_index,
+            text="History Index",
+            font=self.section_font,
+            text_color=PALETTE["text"],
+        ).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 8))
+
+        self.history_index_list = ctk.CTkScrollableFrame(
+            history_index,
+            fg_color=PALETTE["panel_alt"],
+            corner_radius=18,
+            border_width=1,
+            border_color=PALETTE["line"],
+        )
+        self.history_index_list.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 14))
+        ctk.CTkLabel(
+            self.history_index_list,
+            text="Open the drawer to load timestamp + first prompt. No model call needed.",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=220,
+        ).pack(anchor="w", padx=10, pady=10)
+
+        hide_history_button = self.make_button(history_index, "Hide Index", self.hide_history_index_panel, 5, width=130, height=36)
+        hide_history_button.grid(row=2, column=0, sticky="w", padx=18, pady=(0, 18))
+        self.register_action(hide_history_button)
+
         left = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
-        left.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
-        left.grid_rowconfigure(2, weight=1)
+        self.chat_main_frame = left
+        left.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_rowconfigure(2, weight=0)
+        left.grid_rowconfigure(3, weight=0)
         left.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(left, text="Chat", font=self.section_font, text_color=PALETTE["text"]).grid(
-            row=0, column=0, sticky="w", padx=20, pady=(18, 6)
+            row=0, column=0, sticky="w", padx=20, pady=(18, 12)
         )
-        ctk.CTkLabel(
-            left,
-            text="Each prompt runs locally and re-seals the model vault when the response finishes.",
-            font=self.body_font,
-            text_color=PALETTE["muted"],
-        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 12))
 
         self.chat_output = ctk.CTkTextbox(
             left,
@@ -2672,52 +2955,122 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             font=self.body_font,
             wrap="word",
         )
-        self.chat_output.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 16))
-        self.chat_output.insert(
-            "1.0",
-            "Local Chat.\n\n",
-        )
+        self.chat_output.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 16))
         self.chat_output.configure(state="disabled")
-        self.configure_textbox_tags(self.chat_output)
+        self.configure_textbox_tags(self.chat_output, base_size=self.chat_font_size())
 
         compose = ctk.CTkFrame(left, fg_color="transparent")
-        compose.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
+        compose.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 12))
         compose.grid_columnconfigure(0, weight=1)
+        compose.grid_columnconfigure(1, weight=0)
 
         self.chat_input = ctk.CTkTextbox(
             compose,
-            height=110,
+            height=118,
             fg_color=PALETTE["panel_alt"],
             text_color=PALETTE["text"],
             corner_radius=18,
             border_width=1,
             border_color=PALETTE["line"],
-            font=self.body_font,
+            font=ctk.CTkFont(family="DejaVu Sans", size=self.chat_font_size()),
             wrap="word",
         )
         self.chat_input.grid(row=0, column=0, sticky="ew")
-        self.register_action(self.chat_input)
+        self.register_action(self.chat_input, allow_during_busy=True)
         self.chat_input.bind("<Return>", self.handle_chat_return)
         self.chat_input.bind("<Shift-Return>", self.handle_chat_shift_return)
+        self.chat_input.bind("<KeyRelease>", self.update_chat_input_stats)
 
-        actions = ctk.CTkFrame(compose, fg_color="transparent")
-        actions.grid(row=0, column=1, sticky="ns", padx=(14, 0))
-
-        send_button = self.make_button(actions, "Send Prompt", self.submit_chat, 1, width=150, height=46)
-        send_button.pack(pady=(0, 10))
+        send_button = self.make_button(compose, "Send Prompt", self.submit_chat, 1, width=150, height=118)
+        send_button.grid(row=0, column=1, sticky="ns", padx=(14, 0))
         self.register_action(send_button)
 
-        new_session_button = self.make_button(actions, "New Session", self.new_session, 0, width=150, height=42)
-        new_session_button.pack(pady=(0, 10))
+        ctk.CTkLabel(
+            compose,
+            textvariable=self.chat_input_stats_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        toolbar = ctk.CTkFrame(left, fg_color=PALETTE["card_soft"], corner_radius=18, border_width=1, border_color=PALETTE["line"])
+        toolbar.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
+        for column_index in (0, 1, 2, 3):
+            toolbar.grid_columnconfigure(column_index, weight=1)
+        toolbar.grid_columnconfigure(4, weight=2)
+
+        session_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        session_group.grid(row=0, column=0, sticky="w", padx=(14, 8), pady=(12, 8))
+        ctk.CTkLabel(
+            session_group,
+            text="Session",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(side="left", padx=(0, 8))
+
+        new_session_button = self.make_button(session_group, "New", self.new_session, 0, width=86, height=36)
+        new_session_button.pack(side="left", padx=(0, 8))
         self.register_action(new_session_button)
 
-        clear_button = self.make_button(actions, "Clear Chat", self.clear_chat, 3, width=150, height=42)
-        clear_button.pack()
+        clear_button = self.make_button(session_group, "Clear", self.clear_chat, 3, width=88, height=36)
+        clear_button.pack(side="left")
         self.register_action(clear_button)
 
+        drawer_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        drawer_group.grid(row=0, column=1, sticky="w", padx=8, pady=(12, 8))
+        ctk.CTkLabel(
+            drawer_group,
+            text="Drawers",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(side="left", padx=(0, 8))
+
+        self.history_index_toggle_button = self.make_button(
+            drawer_group,
+            "History",
+            self.toggle_history_index_panel,
+            2,
+            width=108,
+            height=36,
+        )
+        self.history_index_toggle_button.pack(side="left", padx=(0, 8))
+        self.register_action(self.history_index_toggle_button)
+
+        self.memory_toggle_button = self.make_button(
+            drawer_group,
+            "Memory",
+            self.toggle_memory_panel,
+            4,
+            width=104,
+            height=36,
+        )
+        self.memory_toggle_button.pack(side="left")
+        self.register_action(self.memory_toggle_button)
+
+        prompt_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        prompt_group.grid(row=0, column=2, sticky="w", padx=8, pady=(12, 8))
+        ctk.CTkLabel(
+            prompt_group,
+            text="Prompt",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(side="left", padx=(0, 8))
+
+        clear_input_button = self.make_button(prompt_group, "Clear Input", self.clear_chat_input, 3, width=112, height=36)
+        clear_input_button.pack(side="left")
+        self.register_action(clear_input_button)
+
+        image_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        image_group.grid(row=0, column=3, sticky="w", padx=8, pady=(12, 8))
+        ctk.CTkLabel(
+            image_group,
+            text="Image",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(side="left", padx=(0, 8))
+
         image_switch = ctk.CTkSwitch(
-            actions,
-            text="Image mode",
+            image_group,
+            text="Mode",
             variable=self.image_mode_var,
             command=self.toggle_image_mode,
             progress_color=PALETTE["accent_teal"],
@@ -2726,29 +3079,60 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             text_color=PALETTE["text"],
             font=self.small_font,
         )
-        image_switch.pack(anchor="w", pady=(14, 8))
+        image_switch.pack(side="left", padx=(0, 12))
         self.register_action(image_switch)
 
-        image_button = self.make_button(actions, "Select Image", self.select_prompt_image, 2, width=150, height=40)
-        image_button.pack(pady=(0, 8))
+        image_button = self.make_button(image_group, "Select", self.select_prompt_image, 2, width=94, height=36)
+        image_button.pack(side="left", padx=(0, 8))
         self.register_action(image_button)
 
-        clear_image_button = self.make_button(actions, "Clear Image", self.clear_prompt_image, 4, width=150, height=38)
-        clear_image_button.pack()
+        clear_image_button = self.make_button(image_group, "Clear", self.clear_prompt_image, 4, width=88, height=36)
+        clear_image_button.pack(side="left")
         self.register_action(clear_image_button)
 
+        voice_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        voice_group.grid(row=0, column=4, sticky="e", padx=(8, 14), pady=(12, 8))
         ctk.CTkLabel(
-            actions,
+            voice_group,
+            text="Reply",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(side="left", padx=(0, 8))
+
+        tts_switch = ctk.CTkSwitch(
+            voice_group,
+            text="Auto",
+            variable=self.tts_enabled_var,
+            progress_color=PALETTE["accent_teal"],
+            button_color=PALETTE["accent_teal"],
+            button_hover_color="#00b85c",
+            text_color=PALETTE["text"],
+            font=self.small_font,
+        )
+        tts_switch.pack(side="left", padx=(0, 10))
+        self.register_action(tts_switch)
+
+        copy_last_button = self.make_button(voice_group, "Copy Last", self.copy_last_reply, 4, width=104, height=36)
+        copy_last_button.pack(side="left", padx=(0, 8))
+        self.register_action(copy_last_button)
+
+        speak_button = self.make_button(voice_group, "Speak Last", self.speak_last_reply, 5, width=110, height=36)
+        speak_button.pack(side="left")
+        self.register_action(speak_button)
+
+        ctk.CTkLabel(
+            toolbar,
             textvariable=self.image_status_var,
             font=self.small_font,
             text_color=PALETTE["muted"],
             justify="left",
-            wraplength=150,
-        ).pack(anchor="w", pady=(10, 0))
+            wraplength=980,
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", padx=14, pady=(0, 12))
 
         right = ctk.CTkFrame(tab, fg_color=PALETTE["card"], corner_radius=24, border_width=1, border_color=PALETTE["line"])
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        self.memory_panel = right
         right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(2, weight=1)
 
         ctk.CTkLabel(right, text="Session Memory", font=self.section_font, text_color=PALETTE["text"]).grid(
             row=0, column=0, sticky="w", padx=20, pady=(18, 6)
@@ -2778,46 +3162,194 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.memory_preview.configure(state="disabled")
         self.configure_textbox_tags(self.memory_preview)
 
-        tts_card = ctk.CTkFrame(right, fg_color=PALETTE["card_soft"], corner_radius=18, border_width=1, border_color=PALETTE["line"])
-        tts_card.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
-        tts_card.grid_columnconfigure(0, weight=1)
+        hide_memory_button = self.make_button(right, "Hide Memory", self.hide_memory_panel, 5, width=140, height=38)
+        hide_memory_button.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 20))
+        self.register_action(hide_memory_button)
+
+    def toggle_memory_panel(self) -> None:
+        if getattr(self, "memory_panel_visible", False):
+            self.hide_memory_panel()
+        else:
+            self.show_memory_panel()
+
+    def show_memory_panel(self) -> None:
+        if not hasattr(self, "memory_panel"):
+            return
+        self.memory_panel_visible = True
+        self.chat_tab.grid_columnconfigure(0, weight=1 if getattr(self, "history_index_visible", False) else 0)
+        self.chat_tab.grid_columnconfigure(1, weight=4)
+        self.chat_tab.grid_columnconfigure(2, weight=2)
+        self.chat_main_frame.grid_configure(padx=(20, 10))
+        self.memory_panel.grid(row=0, column=2, sticky="nsew", padx=(10, 20), pady=20)
+        try:
+            self.memory_toggle_button.configure(text="Hide Memory")
+        except Exception:
+            pass
+        self.refresh_memory_preview()
+
+    def hide_memory_panel(self) -> None:
+        if not hasattr(self, "memory_panel"):
+            return
+        self.memory_panel_visible = False
+        self.memory_panel.grid_remove()
+        self.chat_tab.grid_columnconfigure(0, weight=1 if getattr(self, "history_index_visible", False) else 0)
+        self.chat_tab.grid_columnconfigure(1, weight=1)
+        self.chat_tab.grid_columnconfigure(2, weight=0)
+        self.chat_main_frame.grid_configure(padx=(20, 10) if getattr(self, "history_index_visible", False) else 20)
+        try:
+            self.memory_toggle_button.configure(text="Memory")
+        except Exception:
+            pass
+
+    def toggle_history_index_panel(self) -> None:
+        if getattr(self, "history_index_visible", False):
+            self.hide_history_index_panel()
+        else:
+            self.show_history_index_panel()
+
+    def show_history_index_panel(self) -> None:
+        if not hasattr(self, "history_index_panel"):
+            return
+        self.history_index_visible = True
+        self.chat_tab.grid_columnconfigure(0, weight=1)
+        self.chat_tab.grid_columnconfigure(1, weight=4)
+        self.chat_tab.grid_columnconfigure(2, weight=2 if getattr(self, "memory_panel_visible", False) else 0)
+        self.history_index_panel.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        self.chat_main_frame.grid_configure(padx=(10, 10 if getattr(self, "memory_panel_visible", False) else 20))
+        try:
+            self.history_index_toggle_button.configure(text="Hide Index")
+        except Exception:
+            pass
+        self.load_chat_history_index()
+
+    def hide_history_index_panel(self) -> None:
+        if not hasattr(self, "history_index_panel"):
+            return
+        self.history_index_visible = False
+        self.history_index_panel.grid_remove()
+        self.chat_tab.grid_columnconfigure(0, weight=0)
+        self.chat_tab.grid_columnconfigure(1, weight=1 if not getattr(self, "memory_panel_visible", False) else 4)
+        self.chat_tab.grid_columnconfigure(2, weight=2 if getattr(self, "memory_panel_visible", False) else 0)
+        self.chat_main_frame.grid_configure(padx=(20, 10) if getattr(self, "memory_panel_visible", False) else 20)
+        try:
+            self.history_index_toggle_button.configure(text="History")
+        except Exception:
+            pass
+
+    def load_chat_history_index(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        if self.history_index_loading:
+            self.status_var.set("History index is already loading from encrypted history.")
+            return
+        key_snapshot = self.key
+        if key_snapshot is None:
+            return
+        self.history_index_loading = True
+        if self.history_index_render_after_id is not None:
+            try:
+                self.after_cancel(self.history_index_render_after_id)
+            except Exception:
+                pass
+            self.history_index_render_after_id = None
+        if hasattr(self, "history_index_list"):
+            for child in self.history_index_list.winfo_children():
+                child.destroy()
+            ctk.CTkLabel(
+                self.history_index_list,
+                text="Loading every saved conversation from encrypted history...",
+                font=self.small_font,
+                text_color=PALETTE["muted"],
+                justify="left",
+                wraplength=220,
+            ).pack(anchor="w", padx=10, pady=10)
+        self.status_var.set("Loading full history index from saved prompts...")
+
+        def worker() -> None:
+            try:
+                entries = fetch_history_index_entries(key_snapshot, limit=None)
+            except Exception as exc:
+                self.task_queue.put(("history_index_error", exc))
+                return
+            self.task_queue.put(("history_index_success", entries))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def render_chat_history_index(self, entries: List[Dict[str, Any]]) -> None:
+        if not hasattr(self, "history_index_list"):
+            return
+        for child in self.history_index_list.winfo_children():
+            child.destroy()
+        if not entries:
+            ctk.CTkLabel(
+                self.history_index_list,
+                text="No saved conversations yet.",
+                font=self.small_font,
+                text_color=PALETTE["muted"],
+                justify="left",
+                wraplength=220,
+            ).pack(anchor="w", padx=10, pady=10)
+            return
 
         ctk.CTkLabel(
-            tts_card,
-            text="Local TTS",
+            self.history_index_list,
+            text=f"{len(entries)} saved conversation{'s' if len(entries) != 1 else ''}",
             font=self.small_font,
-            text_color=PALETTE["text"],
-        ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 4))
-
-        tts_switch = ctk.CTkSwitch(
-            tts_card,
-            text="Auto-speak replies",
-            variable=self.tts_enabled_var,
-            progress_color=PALETTE["accent_teal"],
-            button_color=PALETTE["accent_teal"],
-            button_hover_color="#00b85c",
-            text_color=PALETTE["text"],
-            font=self.small_font,
-        )
-        tts_switch.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
-        self.register_action(tts_switch)
-
-        speak_button = self.make_button(tts_card, "Speak Last", self.speak_last_reply, 0, width=130, height=36)
-        speak_button.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 14))
-        self.register_action(speak_button)
-
-        hint = ctk.CTkLabel(
-            right,
-            text=(
-                "Local TTS"
-                "Local AI"
-            ),
-            font=self.small_font,
-            text_color=PALETTE["muted"],
+            text_color=PALETTE["accent_gold"],
             justify="left",
-            wraplength=320,
-        )
-        hint.grid(row=4, column=0, sticky="w", padx=20, pady=(0, 20))
+            wraplength=220,
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        self.render_chat_history_index_batch(entries, 0)
+
+    def render_chat_history_index_batch(self, entries: List[Dict[str, Any]], start_index: int) -> None:
+        batch_size = 12
+        end_index = min(start_index + batch_size, len(entries))
+        for idx, entry in enumerate(entries[start_index:end_index], start=start_index + 1):
+            timestamp = sanitize_text(entry.get("timestamp", ""), max_chars=80).strip()
+            prompt = sanitize_text(entry.get("prompt", "Blank first prompt"), max_chars=120).strip()
+            prompt_label = prompt if len(prompt) <= 58 else prompt[:55].rstrip() + "..."
+            session_label = f"{timestamp} | {prompt_label}" if timestamp else prompt_label
+            card = ctk.CTkFrame(
+                self.history_index_list,
+                fg_color=PALETTE["card_soft"],
+                corner_radius=16,
+                border_width=1,
+                border_color=PALETTE["line"],
+            )
+            card.pack(anchor="w", fill="x", padx=8, pady=(8 if idx == 1 else 4, 4))
+            if timestamp:
+                ctk.CTkLabel(
+                    card,
+                    text=timestamp,
+                    font=self.small_font,
+                    text_color=PALETTE["accent_gold"],
+                    justify="left",
+                ).pack(anchor="w", padx=10, pady=(8, 4))
+            button = self.make_button(
+                card,
+                prompt_label or f"Session {idx}",
+                lambda sid=entry.get("id"), session_title=session_label: self.open_chat_for_session(sid, session_title),
+                idx,
+                width=220,
+                height=36,
+            )
+            button.pack(anchor="w", fill="x", padx=10, pady=(0, 6))
+            turns = int(entry.get("turns", 0) or 0)
+            ctk.CTkLabel(
+                card,
+                text=f"{turns} saved turn{'s' if turns != 1 else ''}",
+                font=self.small_font,
+                text_color=PALETTE["muted"],
+                justify="left",
+            ).pack(anchor="w", padx=10, pady=(0, 8))
+        if end_index < len(entries):
+            self.history_index_render_after_id = self.after(
+                15,
+                lambda: self.render_chat_history_index_batch(entries, end_index),
+            )
+        else:
+            self.history_index_render_after_id = None
+            self.status_var.set(f"History index loaded {len(entries)} saved conversation{'s' if len(entries) != 1 else ''}.")
 
     def build_model_tab(self) -> None:
         tab = self.model_tab
@@ -2828,7 +3360,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         left.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
         left.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(left, text="Model Vault", font=self.section_font, text_color=PALETTE["text"]).grid(
+        ctk.CTkLabel(left, text="Download Model", font=self.section_font, text_color=PALETTE["text"]).grid(
             row=0, column=0, sticky="w", padx=20, pady=(18, 6)
         )
         ctk.CTkLabel(
@@ -3231,6 +3763,37 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         memory_slider.pack(fill="x", padx=20, pady=(0, 12))
         self.register_action(memory_slider)
 
+        chat_font_label = ctk.CTkLabel(
+            look,
+            textvariable=self.chat_font_size_label_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        )
+        chat_font_label.pack(anchor="w", padx=20, pady=(4, 4))
+
+        chat_font_slider = ctk.CTkSlider(
+            look,
+            from_=10,
+            to=22,
+            number_of_steps=12,
+            variable=self.settings_chat_font_size_var,
+            command=self.apply_chat_font_size,
+            progress_color=PALETTE["accent_gold"],
+            button_color=PALETTE["accent_gold"],
+            button_hover_color="#75e69a",
+        )
+        chat_font_slider.pack(fill="x", padx=20, pady=(0, 12))
+        self.register_action(chat_font_slider)
+
+        ctk.CTkLabel(
+            look,
+            text="Adjusts the Chat input and rendered conversation font live.",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
         save_button = self.make_button(look, "Save Settings", self.save_settings_action, 0, width=160)
         save_button.pack(anchor="w", padx=20, pady=(0, 20))
         self.register_action(save_button)
@@ -3324,26 +3887,32 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         lock_button.pack(anchor="w", padx=20, pady=(0, 20))
         self.register_action(lock_button)
 
-    def configure_textbox_tags(self, textbox: ctk.CTkTextbox) -> None:
+    def configure_textbox_tags(self, textbox: ctk.CTkTextbox, *, base_size: Optional[int] = None) -> None:
         try:
             text_widget = textbox._textbox
-            text_widget.configure(font=("DejaVu Sans", 11), spacing1=1, spacing2=1, spacing3=4)
-            text_widget.tag_config("user_header", foreground=PALETTE["accent_orange"], font=("DejaVu Sans", 10, "bold"))
-            text_widget.tag_config("assistant_header", foreground=PALETTE["accent_teal"], font=("DejaVu Sans", 10, "bold"))
-            text_widget.tag_config("meta", foreground=PALETTE["muted"], font=("DejaVu Sans", 9))
-            text_widget.tag_config("md_h1", foreground=PALETTE["accent_teal"], font=("DejaVu Sans", 15, "bold"), spacing1=8, spacing3=6)
-            text_widget.tag_config("md_h2", foreground=PALETTE["accent_gold"], font=("DejaVu Sans", 13, "bold"), spacing1=6, spacing3=4)
-            text_widget.tag_config("md_h3", foreground=PALETTE["accent_blue"], font=("DejaVu Sans", 12, "bold"), spacing1=4, spacing3=3)
-            text_widget.tag_config("md_bold", foreground="#e4ffe9", font=("DejaVu Sans", 11, "bold"))
-            text_widget.tag_config("md_italic", foreground="#d7f7df", font=("DejaVu Sans", 11, "italic"))
-            text_widget.tag_config("md_code_inline", foreground=PALETTE["accent_gold"], background="#142016", font=("DejaVu Sans Mono", 10))
-            text_widget.tag_config("md_code_block", foreground=PALETTE["accent_teal"], background="#08130c", font=("DejaVu Sans Mono", 10), lmargin1=14, lmargin2=14, spacing1=4, spacing3=4)
-            text_widget.tag_config("md_quote", foreground=PALETTE["accent_blue"], font=("DejaVu Sans", 11, "italic"), lmargin1=14, lmargin2=14)
-            text_widget.tag_config("md_quote_bar", foreground=PALETTE["accent_blue"], font=("DejaVu Sans Mono", 11, "bold"))
+            size = max(10, min(22, int(base_size or 11)))
+            header_size = max(9, size - 1)
+            meta_size = max(8, size - 2)
+            code_size = max(9, size - 1)
+            text_widget.configure(font=("DejaVu Sans", size), spacing1=1, spacing2=1, spacing3=4)
+            text_widget.tag_config("user_header", foreground=PALETTE["accent_orange"], font=("DejaVu Sans", header_size, "bold"))
+            text_widget.tag_config("assistant_header", foreground=PALETTE["accent_teal"], font=("DejaVu Sans", header_size, "bold"))
+            text_widget.tag_config("meta", foreground=PALETTE["muted"], font=("DejaVu Sans", meta_size))
+            text_widget.tag_config("md_h1", foreground=PALETTE["accent_teal"], font=("DejaVu Sans", size + 4, "bold"), spacing1=8, spacing3=6)
+            text_widget.tag_config("md_h2", foreground=PALETTE["accent_gold"], font=("DejaVu Sans", size + 2, "bold"), spacing1=6, spacing3=4)
+            text_widget.tag_config("md_h3", foreground=PALETTE["accent_blue"], font=("DejaVu Sans", size + 1, "bold"), spacing1=4, spacing3=3)
+            text_widget.tag_config("md_bold", foreground="#e4ffe9", font=("DejaVu Sans", size, "bold"))
+            text_widget.tag_config("md_italic", foreground="#d7f7df", font=("DejaVu Sans", size, "italic"))
+            text_widget.tag_config("md_code_inline", foreground=PALETTE["accent_gold"], background="#142016", font=("DejaVu Sans Mono", code_size))
+            text_widget.tag_config("md_code_block", foreground=PALETTE["accent_teal"], background="#08130c", font=("DejaVu Sans Mono", code_size), lmargin1=14, lmargin2=14, spacing1=4, spacing3=4)
+            text_widget.tag_config("md_quote", foreground=PALETTE["accent_blue"], font=("DejaVu Sans", size, "italic"), lmargin1=14, lmargin2=14)
+            text_widget.tag_config("md_quote_bar", foreground=PALETTE["accent_blue"], font=("DejaVu Sans Mono", size, "bold"))
             text_widget.tag_config("md_link", foreground=PALETTE["accent_blue"], underline=True)
-            text_widget.tag_config("md_list_marker", foreground=PALETTE["accent_teal"], font=("DejaVu Sans Mono", 11, "bold"))
-            text_widget.tag_config("md_list_text", foreground=PALETTE["text"], font=("DejaVu Sans", 11), lmargin2=24)
-            text_widget.tag_config("md_hr", foreground=PALETTE["muted"], font=("DejaVu Sans Mono", 9), spacing1=6, spacing3=8)
+            text_widget.tag_config("md_list_marker", foreground=PALETTE["accent_teal"], font=("DejaVu Sans Mono", size, "bold"))
+            text_widget.tag_config("md_list_text", foreground=PALETTE["text"], font=("DejaVu Sans", size), lmargin2=24)
+            text_widget.tag_config("md_hr", foreground=PALETTE["muted"], font=("DejaVu Sans Mono", meta_size), spacing1=6, spacing3=8)
+            text_widget.tag_config("md_math_inline", foreground="#e7ff9a", background="#162315", font=("DejaVu Sans Mono", code_size, "bold"))
+            text_widget.tag_config("md_math_block", foreground="#e7ff9a", background="#08130c", font=("DejaVu Sans Mono", size + 1, "bold"), lmargin1=18, lmargin2=18, spacing1=6, spacing3=8)
             for tag_name in ("md_bold", "md_italic", "md_code_inline", "md_link"):
                 text_widget.tag_raise(tag_name)
         except Exception:
@@ -3376,6 +3945,43 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 self.insert_markdown_code_block(textbox, text_widget, code_language, code_lines)
                 if line_index < len(lines):
                     line_index += 1
+                continue
+
+            latex_environment = re.match(r"^\\begin\{([a-zA-Z*]+)\}\s*$", stripped)
+            if latex_environment:
+                environment = latex_environment.group(1)
+                math_lines: List[str] = []
+                line_index += 1
+                while line_index < len(lines):
+                    candidate = lines[line_index].strip()
+                    if candidate == rf"\end{{{environment}}}":
+                        line_index += 1
+                        break
+                    math_lines.append(lines[line_index])
+                    line_index += 1
+                math_text = render_latex_for_display("\n".join(math_lines))
+                text_widget.insert("end", f"  {math_text}\n", ("md_math_block",))
+                continue
+
+            if stripped.startswith("$$") or stripped.startswith(r"\["):
+                closing = "$$" if stripped.startswith("$$") else r"\]"
+                first_line = stripped[2:].strip() if closing == "$$" else stripped[2:].strip()
+                same_line_closed = bool(first_line and first_line.endswith(closing))
+                if same_line_closed:
+                    math_lines = [first_line[: -len(closing)].strip()]
+                else:
+                    math_lines = [first_line] if first_line and first_line != closing else []
+                line_index += 1
+                while not same_line_closed and line_index < len(lines):
+                    candidate = lines[line_index].strip()
+                    if candidate.endswith(closing):
+                        math_lines.append(candidate[: -len(closing)].strip())
+                        line_index += 1
+                        break
+                    math_lines.append(lines[line_index])
+                    line_index += 1
+                math_text = render_latex_for_display("\n".join(math_lines))
+                text_widget.insert("end", f"  {math_text}\n", ("md_math_block",))
                 continue
 
             if re.fullmatch(r"\s*([-*_])(?:\s*\1){2,}\s*", raw_line):
@@ -3454,6 +4060,33 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.update_idletasks()
         self.status_var.set("Code block copied to clipboard.")
 
+    def insert_copy_button(self, textbox: ctk.CTkTextbox, text_widget: Any, value: str, label: str = "Copy") -> None:
+        button = tk.Button(
+            text_widget,
+            text=label,
+            command=lambda copy_value=value, copy_label=label: self.copy_text_to_clipboard(copy_value, copy_label),
+            bg="#1fdb74",
+            fg="#031009",
+            activebackground="#92ffb3",
+            activeforeground="#031009",
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=2,
+            cursor="hand2",
+            font=("DejaVu Sans", 9, "bold"),
+        )
+        widgets = getattr(textbox, "_markdown_widgets", [])
+        widgets.append(button)
+        setattr(textbox, "_markdown_widgets", widgets)
+        text_widget.window_create("end", window=button, padx=8)
+
+    def copy_text_to_clipboard(self, value: str, label: str = "Text") -> None:
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.update_idletasks()
+        self.status_var.set(f"{label} copied to clipboard.")
+
     def clear_markdown_widgets(self, textbox: ctk.CTkTextbox) -> None:
         for widget in getattr(textbox, "_markdown_widgets", []):
             try:
@@ -3464,7 +4097,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
 
     def insert_markdown_inline(self, text_widget: Any, line: str, default_tag: Optional[str] = None) -> None:
         token_re = re.compile(
-            r"(!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|(?<!\*)\*[^*\n]+?\*(?!\*)|(?<!_)_[^_\n]+?_(?!_))"
+            r"(\\\([^)]*\\\)|\$[^$\n]+\$|!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|(?<!\*)\*[^*\n]+?\*(?!\*)|(?<!_)_[^_\n]+?_(?!_))"
         )
         pos = 0
         for match in token_re.finditer(line):
@@ -3481,6 +4114,10 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 label, url = link.groups()
                 text_widget.insert("end", label, ("md_link",))
                 text_widget.insert("end", f" ({url})", ("meta",))
+            elif token.startswith("$") and token.endswith("$"):
+                text_widget.insert("end", render_latex_for_display(token[1:-1]), ("md_math_inline",))
+            elif token.startswith(r"\(") and token.endswith(r"\)"):
+                text_widget.insert("end", render_latex_for_display(token[2:-2]), ("md_math_inline",))
             elif token.startswith("`") and token.endswith("`"):
                 text_widget.insert("end", token[1:-1], ("md_code_inline",))
             elif token.startswith(("**", "__")) and token.endswith(("**", "__")):
@@ -3502,7 +4139,9 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         timestamp = time.strftime("%H:%M:%S")
         try:
             text_widget = self.chat_output._textbox
-            text_widget.insert("end", f"{role}  {timestamp}\n", (tag,))
+            text_widget.insert("end", f"{role}  {timestamp} ", (tag,))
+            self.insert_copy_button(self.chat_output, text_widget, sanitize_text(message), "Copy")
+            text_widget.insert("end", "\n")
             self.insert_markdown_text(self.chat_output, message)
             text_widget.insert("end", "\n")
             text_widget.see("end")
@@ -3512,6 +4151,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_output.configure(state="disabled")
 
     def refresh_memory_preview(self) -> None:
+        if not hasattr(self, "memory_preview"):
+            return
         self.memory_preview.configure(state="normal")
         self.clear_markdown_widgets(self.memory_preview)
         self.memory_preview.delete("1.0", "end")
@@ -3699,6 +4340,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
     def speak_last_reply(self) -> None:
         self.speak_text(self.tts_last_text)
 
+    def copy_last_reply(self) -> None:
+        if not self.tts_last_text:
+            self.status_var.set("No Gemma reply to copy yet.")
+            return
+        self.copy_text_to_clipboard(self.tts_last_text, "Last reply")
+
     def ensure_current_session(self) -> Optional[int]:
         if self.key is None:
             return None
@@ -3711,40 +4358,22 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.refresh_dashboard()
         return self.current_session_id
 
-    def maybe_summarize_first_session_turn(self, prompt: str, reply: str) -> None:
+    def save_first_prompt_session_title(self, prompt: str, reply: str) -> None:
+        del reply
         if self.key is None or self.current_session_id is None or self.session_title_requested:
             return
         self.session_title_requested = True
         session_id = self.current_session_id
         started_at = self.current_session_started_at or time.strftime("%Y-%m-%d %H:%M:%S")
-
-        def on_success(title: str) -> None:
-            if self.key is None:
-                return
-            final_title = f"{sanitize_text(title, max_chars=80).strip()} · {started_at}"
+        title_text = " ".join(sanitize_text(prompt, max_chars=90).split())[:70].rstrip() or "Local chat"
+        final_title = f"{title_text} · {started_at}"
+        try:
             update_session_title(self.key, session_id, final_title)
             self.current_session_title = final_title
             self.refresh_dashboard()
-            self.status_var.set("Session title summarized and saved.")
-
-        def on_error(exc: Exception) -> None:
-            fallback = f"{sanitize_text(prompt, max_chars=48).strip() or 'Local chat'} · {started_at}"
-            try:
-                if self.key is not None:
-                    update_session_title(self.key, session_id, fallback)
-                    self.current_session_title = fallback
-                    self.refresh_dashboard()
-            except Exception:
-                pass
-            self.status_var.set(f"Session summary fallback saved: {sanitize_text(exc, max_chars=100)}")
-
-        self.run_process_task(
-            "Summarizing the new session...",
-            "session_title",
-            (self.key, prompt, reply),
-            on_success=on_success,
-            on_error=on_error,
-        )
+            self.status_var.set("Session saved with a local first-prompt title.")
+        except Exception as exc:
+            self.status_var.set(f"Session title update skipped: {sanitize_text(exc, max_chars=100)}")
 
     def handle_chat_return(self, _event: Any) -> str:
         self.submit_chat()
@@ -3776,6 +4405,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             display_prompt = f"{prompt}\n[Image attached: {Path(image_path).name} | {mode} mode]"
         self.append_chat_message("You", display_prompt)
         self.chat_input.delete("1.0", "end")
+        self.update_chat_input_stats()
         self.status_var.set("Sending prompt to the local model...")
 
         def on_success(reply: str) -> None:
@@ -3788,7 +4418,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.status_var.set("Reply ready. The model vault has been sealed again.")
             if self.tts_enabled_var.get():
                 self.speak_text(safe_reply)
-            self.maybe_summarize_first_session_turn(prompt, safe_reply)
+            self.save_first_prompt_session_title(prompt, safe_reply)
 
         def on_error(exc: Exception) -> None:
             self.status_var.set(str(exc))
@@ -3817,10 +4447,10 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             on_error=on_error,
         )
 
-    def download_model_action(self) -> None:
+    def download_model_action(self, confirm: bool = True) -> None:
         if not self.ensure_unlocked():
             return
-        if messagebox and not messagebox.askyesno(
+        if confirm and messagebox and not messagebox.askyesno(
             "Download model",
             "Download the Gemma LiteRT-LM model, verify its hash, and seal it into the encrypted vault?",
         ):
@@ -4071,11 +4701,17 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             )
         else:
             for row_id, stamp, prompt, response in rows:
-                self.history_box.insert("end", f"[{row_id}] {sanitize_text(stamp, max_chars=80)}\n", ("meta",))
+                clean_prompt = sanitize_text(prompt, max_chars=8000)
+                clean_response = sanitize_text(response, max_chars=12000)
+                self.history_box.insert("end", f"[{row_id}] {sanitize_text(stamp, max_chars=80)} ", ("meta",))
+                self.insert_copy_button(self.history_box, self.history_box._textbox, clean_prompt, "Copy Prompt")
+                self.history_box.insert("end", " ", ("meta",))
+                self.insert_copy_button(self.history_box, self.history_box._textbox, clean_response, "Copy Reply")
+                self.history_box.insert("end", "\n", ("meta",))
                 self.history_box.insert("end", "Prompt:\n", ("user_header",))
-                self.insert_markdown_text(self.history_box, prompt, max_chars=8000)
+                self.insert_markdown_text(self.history_box, clean_prompt, max_chars=8000)
                 self.history_box.insert("end", "\nResponse:\n", ("assistant_header",))
-                self.insert_markdown_text(self.history_box, response, max_chars=12000)
+                self.insert_markdown_text(self.history_box, clean_response, max_chars=12000)
                 self.history_box.insert("end", "\n" + ("─" * 54) + "\n\n", ("md_hr",))
         if search:
             self.highlight_history_matches(search)
@@ -4104,6 +4740,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.settings_data["include_system_entropy"] = bool(self.settings_entropy_var.get())
         self.settings_data["delete_plaintext_after_encrypt"] = bool(self.settings_delete_plaintext_var.get())
         self.settings_data["chat_memory_turns"] = int(self.settings_memory_turns_var.get())
+        self.settings_data["chat_font_size"] = self.chat_font_size()
         self.settings_data["enable_native_image_input"] = bool(self.settings_native_image_var.get())
         self.settings_data["chat_style"] = normalize_setting_choice(
             self.settings_chat_style_var.get(), CHAT_STYLE_OPTIONS, "Balanced"
@@ -4115,7 +4752,8 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         save_settings(self.settings_data)
         self.status_var.set(
             "Settings saved. Prompt profile: "
-            f"{self.settings_data['chat_style']} / {self.settings_data['response_depth']}."
+            f"{self.settings_data['chat_style']} / {self.settings_data['response_depth']} "
+            f"with {self.settings_data['chat_font_size']} px chat text."
         )
 
     def change_password_action(self) -> None:

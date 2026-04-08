@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -86,9 +87,19 @@ LEGACY_RUNTIME_MODEL_PATH = MODELS_DIR / (MODEL_FILE + ".runtime")
 RUNTIME_MODEL_PATH = MODELS_DIR / f"runtime-{MODEL_FILE}"
 DB_PATH = Path("chat_history.db.aes")
 KEY_PATH = Path(".enc_key")
+KEY_ROTATION_PENDING_PATH = Path(".enc_key.pending")
 SETTINGS_PATH = Path("gui_settings.json")
 CACHE_DIR = Path(".litert_lm_cache")
 STREAM_MAGIC = b"HGGM2"
+KEY_FILE_MAGIC = b"HMK2"
+KEY_FILE_VERSION = 2
+KEY_FILE_SALT_BYTES = 16
+KEY_FILE_NONCE_BYTES = 12
+KEY_FILE_MASTER_BYTES = 32
+LEGACY_PBKDF2_ITERATIONS = 200_000
+WRAPPED_KEY_PBKDF2_ITERATIONS = 350_000
+NETWORK_TIMEOUT = httpx.Timeout(connect=15.0, read=90.0, write=90.0, pool=15.0)
+SQLITE_SIDECAREXTENSIONS = ("-journal", "-wal", "-shm")
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 HISTORY_PAGE_SIZE = 12
@@ -96,6 +107,9 @@ CHAT_TOOLBAR_STATE_KEY = "chat_toolbar_visible"
 DYNAMIC_SUPPORT_RAG_HISTORY_KEY = "dynamic_support_rag_history"
 DASHBOARD_QUANTUM_COLOR_STATE_KEY = "dashboard_quantum_color_state"
 DASHBOARD_QUANTUM_COLOR_TRAIL_KEY = "dashboard_quantum_color_trail"
+VAULT_ROTATION_MACHINE_STATE_KEY = "vault_rotation_machine_state"
+VAULT_ROTATION_AUDIT_LOG_KEY = "vault_rotation_audit_log"
+VAULT_HARDENING_STATE_KEY = "vault_hardening_state"
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 LATEX_COMMAND_REPLACEMENTS = {
@@ -194,6 +208,19 @@ SUBSCRIPT_CHARS = {
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SECURE_TEMP_ROOT = CACHE_DIR / ".secure_vault_tmp"
+SECURE_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _set_owner_only_permissions(path: Path, *, is_dir: bool = False) -> None:
+    try:
+        os.chmod(path, 0o700 if is_dir else 0o600)
+    except Exception:
+        pass
+
+
+_set_owner_only_permissions(CACHE_DIR, is_dir=True)
+_set_owner_only_permissions(SECURE_TEMP_ROOT, is_dir=True)
 
 PALETTE = {
     "window": "#030604",
@@ -222,6 +249,20 @@ TIE_DYE = [
     ("#68ff9a", "#4be783"),
     ("#a6ffbf", "#82efa5"),
     ("#94ffb8", "#75e69a"),
+]
+ENTROPIC_COLORWHEEL = [
+    ("Jade Helix", "#39ff88", "bias toward clean local repair and quick verification"),
+    ("Aurora Lattice", "#94ffb8", "favor transparent structure over hidden cleverness"),
+    ("Signal Mint", "#68ff9a", "reduce noise and keep the next step obvious"),
+    ("Cipher Ember", "#ff9166", "shorten the rotation window and tighten hardening checks"),
+    ("Cobalt Arc", "#67d5ff", "prefer measured inspection before any risky rewrite"),
+    ("Solar Reed", "#f5ff7a", "nudge reviews toward integrity and drift detection"),
+    ("Ion Coral", "#ff7f8c", "surface anomalies early and document why they matter"),
+    ("Vector Moss", "#6fcb8a", "keep the system calm, minimal, and less stateful"),
+    ("Prism Alloy", "#c2ffd6", "rebalance load, secrecy, and recoverability"),
+    ("Midnight Quartz", "#8fb6ff", "treat uncertainty as a reason to harden boundaries"),
+    ("Copper Bloom", "#ffb36b", "rotate sooner when pressure and entropy both rise"),
+    ("Tidal Glass", "#86fff1", "favor durable defaults over theatrical randomness"),
 ]
 
 CHAT_STYLE_OPTIONS = ["Balanced", "Code", "Teacher", "Creative", "Research"]
@@ -489,62 +530,219 @@ def image_metadata_prompt(image_path: Path, *, native_requested: bool, native_al
 def safe_cleanup(paths: List[Path]) -> None:
     for path in paths:
         try:
-            if path.exists():
+            if not path.exists():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
                 path.unlink()
         except Exception:
             pass
 
 
+def _sqlite_sidecar_paths(path: Path) -> List[Path]:
+    return [Path(f"{path}{suffix}") for suffix in SQLITE_SIDECAREXTENSIONS]
+
+
+def cleanup_sqlite_sidecars(path: Path) -> None:
+    safe_cleanup(_sqlite_sidecar_paths(path))
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        descriptor = os.open(str(directory), os.O_RDONLY)
+    except Exception:
+        return
+    try:
+        os.fsync(descriptor)
+    except Exception:
+        pass
+    finally:
+        try:
+            os.close(descriptor)
+        except Exception:
+            pass
+
+
+def _atomic_replace(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    src.replace(dest)
+    _set_owner_only_permissions(dest, is_dir=False)
+    _fsync_directory(dest.parent)
+
+
+def _write_bytes_atomic(dest: Path, data: bytes) -> None:
+    temp_path = _temp_path(dest.parent, dest.suffix or ".tmp", prefix=f".{dest.stem}_")
+    with temp_path.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _atomic_replace(temp_path, dest)
+
+
+def _write_text_atomic(dest: Path, text: str, *, encoding: str = "utf-8") -> None:
+    _write_bytes_atomic(dest, text.encode(encoding))
+
+
+def _temp_directory(root: Path, prefix: str = "humoid_") -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    _set_owner_only_permissions(root, is_dir=True)
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+    _set_owner_only_permissions(path, is_dir=True)
+    return path
+
+
+def _is_within_secure_temp_root(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(SECURE_TEMP_ROOT.resolve())
+        return True
+    except Exception:
+        return False
+
+
 def _temp_path(directory: Path, suffix: str, prefix: str = "humoid_") -> Path:
     directory.mkdir(parents=True, exist_ok=True)
+    if _is_within_secure_temp_root(directory):
+        _set_owner_only_permissions(directory, is_dir=True)
     handle = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, dir=directory, delete=False)
     handle.close()
-    return Path(handle.name)
+    path = Path(handle.name)
+    _set_owner_only_permissions(path, is_dir=False)
+    return path
+
+
+def _temp_db_workspace() -> Tuple[Path, Path]:
+    workspace = _temp_directory(SECURE_TEMP_ROOT / "db", prefix="history_")
+    temp_db = workspace / "vault_history.db"
+    temp_db.touch()
+    _set_owner_only_permissions(temp_db, is_dir=False)
+    return workspace, temp_db
 
 
 def _temp_db_path() -> Path:
-    return _temp_path(DB_PATH.parent, ".db", prefix="history_")
+    return _temp_path(SECURE_TEMP_ROOT / "db", ".db", prefix="history_")
 
 
 def _temp_model_path() -> Path:
-    return _temp_path(MODELS_DIR, ".litertlm", prefix="model_")
+    return _temp_path(SECURE_TEMP_ROOT / "model", ".litertlm", prefix="model_")
 
 
 def _temp_encrypted_model_path() -> Path:
-    return _temp_path(MODELS_DIR, ".litertlm.aes", prefix="vault_")
+    return _temp_path(SECURE_TEMP_ROOT / "model", ".litertlm.aes", prefix="vault_")
 
 
 def _temp_encrypted_db_path() -> Path:
-    return _temp_path(DB_PATH.parent, ".db.aes", prefix="vault_history_")
+    return _temp_path(SECURE_TEMP_ROOT / "db", ".db.aes", prefix="vault_history_")
 
 
 def _write_key_file(key_bytes: bytes) -> None:
-    KEY_PATH.write_bytes(key_bytes)
-    try:
-        os.chmod(KEY_PATH, 0o600)
-    except Exception:
-        pass
+    _write_bytes_atomic(KEY_PATH, key_bytes)
+    _set_owner_only_permissions(KEY_PATH, is_dir=False)
 
 
-def derive_key_from_passphrase(password: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
+def _write_pending_key_file(key_bytes: bytes) -> None:
+    _write_bytes_atomic(KEY_ROTATION_PENDING_PATH, key_bytes)
+    _set_owner_only_permissions(KEY_ROTATION_PENDING_PATH, is_dir=False)
+
+
+def derive_key_from_passphrase(
+    password: str,
+    salt: Optional[bytes] = None,
+    *,
+    iterations: int = LEGACY_PBKDF2_ITERATIONS,
+) -> Tuple[bytes, bytes]:
     if salt is None:
-        salt = os.urandom(16)
+        salt = os.urandom(KEY_FILE_SALT_BYTES)
     kdf_der = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=200_000,
+        iterations=int(max(100_000, iterations)),
     )
     return salt, kdf_der.derive(password.encode("utf-8"))
 
 
-def detect_key_mode() -> str:
-    if not KEY_PATH.exists():
+def _serialize_wrapped_master_key_record(
+    salt: bytes,
+    nonce: bytes,
+    ciphertext: bytes,
+    *,
+    iterations: int = WRAPPED_KEY_PBKDF2_ITERATIONS,
+) -> bytes:
+    return b"".join(
+        [
+            KEY_FILE_MAGIC,
+            struct.pack(">B", KEY_FILE_VERSION),
+            struct.pack(">I", int(max(100_000, iterations))),
+            salt,
+            nonce,
+            ciphertext,
+        ]
+    )
+
+
+def _parse_wrapped_master_key_record(data: bytes) -> Tuple[int, bytes, bytes, bytes]:
+    minimum_size = len(KEY_FILE_MAGIC) + 1 + 4 + KEY_FILE_SALT_BYTES + KEY_FILE_NONCE_BYTES + 16
+    if len(data) < minimum_size or not data.startswith(KEY_FILE_MAGIC):
+        raise ValueError("The passphrase key file is invalid.")
+    version = data[len(KEY_FILE_MAGIC)]
+    if version != KEY_FILE_VERSION:
+        raise ValueError(f"Unsupported key file version: {version}.")
+    cursor = len(KEY_FILE_MAGIC) + 1
+    iterations = int(struct.unpack(">I", data[cursor : cursor + 4])[0])
+    cursor += 4
+    salt = data[cursor : cursor + KEY_FILE_SALT_BYTES]
+    cursor += KEY_FILE_SALT_BYTES
+    nonce = data[cursor : cursor + KEY_FILE_NONCE_BYTES]
+    cursor += KEY_FILE_NONCE_BYTES
+    ciphertext = data[cursor:]
+    if len(salt) != KEY_FILE_SALT_BYTES or len(nonce) != KEY_FILE_NONCE_BYTES or len(ciphertext) < 16:
+        raise ValueError("The passphrase key file is incomplete.")
+    return iterations, salt, nonce, ciphertext
+
+
+def detect_key_storage_generation() -> str:
+    sources = [path for path in (KEY_PATH, KEY_ROTATION_PENDING_PATH) if path.exists()]
+    if not sources:
         return "missing"
-    data = KEY_PATH.read_bytes()
-    if len(data) >= 48:
+    for key_source in sources:
+        data = key_source.read_bytes()
+        if data.startswith(KEY_FILE_MAGIC):
+            try:
+                _parse_wrapped_master_key_record(data)
+            except Exception:
+                continue
+            return "wrapped_master_v2"
+        if len(data) >= 48:
+            return "derived_key_v1"
+        if len(data) >= 32:
+            return "legacy_raw"
+    return "invalid"
+
+
+def wrap_master_key_for_passphrase(password: str, master_key: bytes) -> bytes:
+    salt, wrapping_key = derive_key_from_passphrase(
+        password,
+        iterations=WRAPPED_KEY_PBKDF2_ITERATIONS,
+    )
+    aes = AESGCM(wrapping_key)
+    nonce = os.urandom(KEY_FILE_NONCE_BYTES)
+    ciphertext = aes.encrypt(nonce, master_key, KEY_FILE_MAGIC)
+    return _serialize_wrapped_master_key_record(
+        salt,
+        nonce,
+        ciphertext,
+        iterations=WRAPPED_KEY_PBKDF2_ITERATIONS,
+    )
+
+
+def detect_key_mode() -> str:
+    generation = detect_key_storage_generation()
+    if generation == "missing":
+        return "missing"
+    if generation in {"wrapped_master_v2", "derived_key_v1"}:
         return "passphrase"
-    if len(data) >= 32:
+    if generation == "legacy_raw":
         return "legacy_raw"
     return "invalid"
 
@@ -556,22 +754,61 @@ def read_legacy_key() -> bytes:
     return data[:32]
 
 
-def unlock_key_with_passphrase(password: str) -> bytes:
-    data = KEY_PATH.read_bytes()
+def _unlock_passphrase_file(path: Path, password: str) -> bytes:
+    data = path.read_bytes()
+    if data.startswith(KEY_FILE_MAGIC):
+        iterations, salt, nonce, ciphertext = _parse_wrapped_master_key_record(data)
+        _, wrapping_key = derive_key_from_passphrase(password, salt, iterations=iterations)
+        aes = AESGCM(wrapping_key)
+        try:
+            master_key = aes.decrypt(nonce, ciphertext, KEY_FILE_MAGIC)
+        except Exception as exc:
+            raise ValueError("Incorrect password.") from exc
+        if len(master_key) != KEY_FILE_MASTER_BYTES:
+            raise ValueError("The unwrapped master key has an invalid length.")
+        return master_key
     if len(data) < 48:
         raise ValueError("No passphrase-derived key is stored yet.")
     salt = data[:16]
     stored_key = data[16:48]
-    _, derived_key = derive_key_from_passphrase(password, salt)
+    _, derived_key = derive_key_from_passphrase(password, salt, iterations=LEGACY_PBKDF2_ITERATIONS)
     if not hmac.compare_digest(stored_key, derived_key):
         raise ValueError("Incorrect password.")
     return derived_key
 
 
+def unlock_key_with_passphrase(password: str) -> bytes:
+    key_sources = [KEY_PATH]
+    if KEY_ROTATION_PENDING_PATH.exists():
+        key_sources.append(KEY_ROTATION_PENDING_PATH)
+
+    last_error: Optional[Exception] = None
+    for source_path in key_sources:
+        try:
+            key = _unlock_passphrase_file(source_path, password)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if source_path == KEY_ROTATION_PENDING_PATH:
+            _write_key_file(source_path.read_bytes())
+            safe_cleanup([KEY_ROTATION_PENDING_PATH])
+        elif KEY_ROTATION_PENDING_PATH.exists():
+            try:
+                if KEY_PATH.read_bytes() == KEY_ROTATION_PENDING_PATH.read_bytes():
+                    safe_cleanup([KEY_ROTATION_PENDING_PATH])
+            except Exception:
+                pass
+        return key
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError("No passphrase-derived key is stored yet.")
+
+
 def create_passphrase_key(password: str) -> bytes:
-    salt, key = derive_key_from_passphrase(password)
-    _write_key_file(salt + key)
-    return key
+    master_key = os.urandom(KEY_FILE_MASTER_BYTES)
+    _write_key_file(wrap_master_key_for_passphrase(password, master_key))
+    return master_key
 
 
 def aes_encrypt_bytes(data: bytes, key: bytes) -> bytes:
@@ -594,7 +831,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def encrypt_file(src: Path, dest: Path, key: bytes) -> None:
+def _encrypt_file_to_path(src: Path, dest: Path, key: bytes) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     nonce = os.urandom(12)
     encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
@@ -606,6 +843,17 @@ def encrypt_file(src: Path, dest: Path, key: bytes) -> None:
             out_handle.write(encryptor.update(chunk))
         out_handle.write(encryptor.finalize())
         out_handle.write(encryptor.tag)
+        out_handle.flush()
+        os.fsync(out_handle.fileno())
+
+
+def encrypt_file(src: Path, dest: Path, key: bytes) -> None:
+    temp_dest = _temp_path(dest.parent, dest.suffix or ".tmp", prefix=f".{dest.stem}_")
+    try:
+        _encrypt_file_to_path(src, temp_dest, key)
+        _atomic_replace(temp_dest, dest)
+    finally:
+        safe_cleanup([temp_dest])
 
 
 def _decrypt_stream_file(src: Path, dest: Path, key: bytes) -> None:
@@ -634,6 +882,8 @@ def _decrypt_stream_file(src: Path, dest: Path, key: bytes) -> None:
                 remaining -= len(chunk)
                 out_handle.write(decryptor.update(chunk))
             out_handle.write(decryptor.finalize())
+            out_handle.flush()
+            os.fsync(out_handle.fileno())
 
 
 def decrypt_file(src: Path, dest: Path, key: bytes) -> None:
@@ -641,10 +891,12 @@ def decrypt_file(src: Path, dest: Path, key: bytes) -> None:
         header = handle.read(len(STREAM_MAGIC))
     if header == STREAM_MAGIC:
         _decrypt_stream_file(src, dest, key)
+        _set_owner_only_permissions(dest, is_dir=False)
         return
 
     plaintext = aes_decrypt_bytes(src.read_bytes(), key)
-    dest.write_bytes(plaintext)
+    _write_bytes_atomic(dest, plaintext)
+    _set_owner_only_permissions(dest, is_dir=False)
 
 
 def download_model_httpx(
@@ -657,7 +909,7 @@ def download_model_httpx(
     dest.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
 
-    with httpx.stream("GET", url, follow_redirects=True, timeout=None) as response:
+    with httpx.stream("GET", url, follow_redirects=True, timeout=NETWORK_TIMEOUT) as response:
         response.raise_for_status()
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
@@ -678,8 +930,27 @@ def download_model_httpx(
     return sha
 
 
+def connect_sqlite(path: Path | str) -> sqlite3.Connection:
+    db = sqlite3.connect(path)
+    try:
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA busy_timeout=5000")
+        db.execute("PRAGMA temp_store=MEMORY")
+        db.execute("PRAGMA journal_mode=MEMORY")
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA secure_delete=ON")
+        try:
+            db.execute("PRAGMA trusted_schema=OFF")
+        except Exception:
+            pass
+    except Exception:
+        db.close()
+        raise
+    return db
+
+
 def _initialize_plaintext_db(path: Path) -> None:
-    with sqlite3.connect(path) as db:
+    with connect_sqlite(path) as db:
         _ensure_plaintext_db_schema(db)
         db.commit()
 
@@ -728,19 +999,21 @@ def _ensure_plaintext_db_schema(db: sqlite3.Connection) -> None:
 
 @contextmanager
 def unlocked_db_path(key: bytes):
-    temp_db = _temp_db_path()
+    workspace, temp_db = _temp_db_workspace()
     try:
         if DB_PATH.exists():
             decrypt_file(DB_PATH, temp_db, key)
         else:
             _initialize_plaintext_db(temp_db)
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             _ensure_plaintext_db_schema(db)
             db.commit()
         yield temp_db
+        cleanup_sqlite_sidecars(temp_db)
         encrypt_file(temp_db, DB_PATH, key)
     finally:
-        safe_cleanup([temp_db])
+        cleanup_sqlite_sidecars(temp_db)
+        safe_cleanup([workspace])
 
 
 def init_db(key: bytes) -> None:
@@ -753,7 +1026,7 @@ def init_db(key: bytes) -> None:
 def create_chat_session(key: bytes) -> int:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             cursor = db.execute(
                 "INSERT INTO sessions (started_at, updated_at, title) VALUES (?, ?, ?)",
                 (timestamp, timestamp, f"Session {timestamp}"),
@@ -766,7 +1039,7 @@ def update_session_title(key: bytes, session_id: int, title: str) -> None:
     clean_title = sanitize_text(title, max_chars=120).strip() or "Untitled session"
     clean_title = clean_title.replace("\n", " ")
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             db.execute(
                 "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
                 (clean_title, time.strftime("%Y-%m-%d %H:%M:%S"), session_id),
@@ -776,7 +1049,7 @@ def update_session_title(key: bytes, session_id: int, title: str) -> None:
 
 def fetch_recent_sessions(key: bytes, limit: int = 6) -> List[Dict[str, Any]]:
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             cursor = db.execute(
                 "SELECT s.id, "
                 "COALESCE((SELECT h2.timestamp FROM history h2 WHERE h2.session_id = s.id ORDER BY h2.id ASC LIMIT 1), s.started_at, ''), "
@@ -811,7 +1084,7 @@ def fetch_recent_sessions(key: bytes, limit: int = 6) -> List[Dict[str, Any]]:
 
 def fetch_history_index_entries(key: bytes, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             limit_clause = "" if limit is None or limit <= 0 else " LIMIT ?"
             params: Tuple[int, ...] = () if limit is None or limit <= 0 else (limit,)
             cursor = db.execute(
@@ -841,7 +1114,7 @@ def fetch_history_index_entries(key: bytes, limit: Optional[int] = None) -> List
 
 def fetch_session_chat_rows(key: bytes, session_id: int) -> Dict[str, Any]:
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             session_row = db.execute(
                 "SELECT id, started_at, updated_at, title FROM sessions WHERE id = ?",
                 (session_id,),
@@ -868,7 +1141,7 @@ def fetch_session_chat_rows(key: bytes, session_id: int) -> Dict[str, Any]:
 def log_interaction(prompt: str, response: str, key: bytes, session_id: Optional[int] = None) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             db.execute(
                 "INSERT INTO history (timestamp, prompt, response, session_id) VALUES (?, ?, ?, ?)",
                 (timestamp, prompt, response, session_id),
@@ -906,7 +1179,7 @@ def history_search_where_clause(terms: List[str]) -> Tuple[str, List[str]]:
 def fetch_history(key: bytes, limit: int = 12, offset: int = 0, search: Optional[str] = None) -> List[Tuple[int, str, str, str]]:
     rows: List[Tuple[int, str, str, str]] = []
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             terms = history_search_terms(search)
             where_clause, params = history_search_where_clause(terms)
             if terms:
@@ -927,7 +1200,7 @@ def fetch_history(key: bytes, limit: int = 12, offset: int = 0, search: Optional
 
 def count_history_rows(key: bytes, search: Optional[str] = None) -> int:
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             terms = history_search_terms(search)
             where_clause, params = history_search_where_clause(terms)
             if terms:
@@ -945,7 +1218,7 @@ def fetch_app_state_value(key: bytes, name: str, default: str = "") -> str:
     if not clean_name:
         return default
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             row = db.execute("SELECT value FROM app_state WHERE name = ?", (clean_name,)).fetchone()
     if row is None or row[0] is None:
         return default
@@ -959,7 +1232,7 @@ def save_app_state_value(key: bytes, name: str, value: str) -> None:
     clean_value = sanitize_text(value, max_chars=4000)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             db.execute(
                 "INSERT OR REPLACE INTO app_state (name, value, updated_at) VALUES (?, ?, ?)",
                 (clean_name, clean_value, timestamp),
@@ -1205,6 +1478,222 @@ def dashboard_quantum_color_trail_context_line(trail: Optional[List[Dict[str, st
     )
 
 
+def current_vault_hardening_features() -> List[str]:
+    return [
+        "wrapped_master_key_v2",
+        "rotation_pending_recovery",
+        "atomic_encrypted_writes",
+        "private_sqlite_temp_workspace",
+        "sqlite_temp_store_memory",
+        "bounded_network_timeouts",
+        "ephemeral_runtime_model_unlock",
+    ]
+
+
+def normalize_vault_hardening_state(state: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not isinstance(state, dict):
+        return {}
+    features = state.get("features", [])
+    if not isinstance(features, list):
+        features = []
+    clean_features: List[str] = []
+    for value in features:
+        clean_value = sanitize_text(value, max_chars=80).strip()
+        if clean_value and clean_value not in clean_features:
+            clean_features.append(clean_value)
+    return {
+        "updated_at": sanitize_text(state.get("updated_at", ""), max_chars=80).strip(),
+        "key_generation": sanitize_text(state.get("key_generation", ""), max_chars=80).strip(),
+        "temp_root": sanitize_text(state.get("temp_root", ""), max_chars=160).strip(),
+        "features": ", ".join(clean_features[:8]),
+    }
+
+
+def load_vault_hardening_state(key: bytes) -> Dict[str, str]:
+    raw_value = fetch_app_state_value(key, VAULT_HARDENING_STATE_KEY, default="{}")
+    try:
+        state = json.loads(raw_value)
+    except Exception:
+        return {}
+    return normalize_vault_hardening_state(state)
+
+
+def save_vault_hardening_state(key: bytes) -> Dict[str, str]:
+    state = {
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "key_generation": detect_key_storage_generation(),
+        "temp_root": sanitize_text(str(SECURE_TEMP_ROOT), max_chars=160),
+        "features": current_vault_hardening_features(),
+    }
+    save_app_state_value(key, VAULT_HARDENING_STATE_KEY, json.dumps(state, sort_keys=True))
+    return normalize_vault_hardening_state(state)
+
+
+def normalize_vault_rotation_machine_state(state: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not isinstance(state, dict):
+        return {}
+    color = sanitize_text(state.get("colorwheel_color", ""), max_chars=16).strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        color = ""
+    return {
+        "generated_at": sanitize_text(state.get("generated_at", ""), max_chars=80).strip(),
+        "reason": sanitize_text(state.get("reason", ""), max_chars=120).strip(),
+        "entropic_gain": sanitize_text(state.get("entropic_gain", ""), max_chars=16).strip(),
+        "colorwheel_sector": sanitize_text(state.get("colorwheel_sector", ""), max_chars=80).strip(),
+        "colorwheel_color": color.lower(),
+        "colorwheel_note": sanitize_text(state.get("colorwheel_note", ""), max_chars=160).strip(),
+        "rotation_window_days": sanitize_text(state.get("rotation_window_days", ""), max_chars=16).strip(),
+        "rotation_jitter_minutes": sanitize_text(state.get("rotation_jitter_minutes", ""), max_chars=16).strip(),
+        "next_rotation_at": sanitize_text(state.get("next_rotation_at", ""), max_chars=80).strip(),
+        "seed_fingerprint": sanitize_text(state.get("seed_fingerprint", ""), max_chars=32).strip(),
+        "key_generation": sanitize_text(state.get("key_generation", ""), max_chars=80).strip(),
+    }
+
+
+def load_vault_rotation_machine_state(key: bytes) -> Dict[str, str]:
+    raw_value = fetch_app_state_value(key, VAULT_ROTATION_MACHINE_STATE_KEY, default="{}")
+    try:
+        state = json.loads(raw_value)
+    except Exception:
+        return {}
+    return normalize_vault_rotation_machine_state(state)
+
+
+def load_vault_rotation_audit_log(key: bytes) -> List[Dict[str, str]]:
+    raw_value = fetch_app_state_value(key, VAULT_ROTATION_AUDIT_LOG_KEY, default="[]")
+    try:
+        values = json.loads(raw_value)
+    except Exception:
+        return []
+    if not isinstance(values, list):
+        return []
+    entries: List[Dict[str, str]] = []
+    for value in values[:12]:
+        clean = normalize_vault_rotation_machine_state(value)
+        if clean:
+            entries.append(clean)
+    return entries
+
+
+def save_vault_rotation_audit_log(key: bytes, entries: List[Dict[str, Any]]) -> None:
+    clean_entries = [normalize_vault_rotation_machine_state(entry) for entry in entries if entry]
+    save_app_state_value(key, VAULT_ROTATION_AUDIT_LOG_KEY, json.dumps(clean_entries[:12], sort_keys=True))
+
+
+def build_vault_rotation_machine_state(
+    reason: str,
+    *,
+    dashboard_state: Optional[Dict[str, str]] = None,
+    dashboard_trail: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, str]:
+    generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    metrics = {"cpu": 0.0, "mem": 0.0, "load1": 0.0, "temp": 0.0}
+    score = 0.5
+    try:
+        metrics = collect_system_metrics()
+        score = pennylane_entropic_score(metrics_to_rgb(metrics), shots=96)
+    except Exception:
+        pass
+
+    seed_material = "|".join(
+        [
+            generated_at,
+            sanitize_text(reason, max_chars=120),
+            detect_key_storage_generation(),
+            f"{metrics.get('cpu', 0.0):.4f}",
+            f"{metrics.get('mem', 0.0):.4f}",
+            f"{metrics.get('load1', 0.0):.4f}",
+            f"{metrics.get('temp', 0.0):.4f}",
+            f"{score:.4f}",
+            dashboard_quantum_color_signature(dashboard_state),
+            dashboard_quantum_color_trail_signature(dashboard_trail),
+            str(ENCRYPTED_MODEL.stat().st_size if ENCRYPTED_MODEL.exists() else 0),
+            str(DB_PATH.stat().st_size if DB_PATH.exists() else 0),
+            os.urandom(16).hex(),
+            str(time.time_ns()),
+        ]
+    )
+    digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+    entropic_gain = max(
+        0.15,
+        min(
+            0.99,
+            (score * 0.58)
+            + (metrics.get("cpu", 0.0) * 0.12)
+            + (metrics.get("mem", 0.0) * 0.10)
+            + (metrics.get("load1", 0.0) * 0.10)
+            + ((digest[1] / 255.0) * 0.10),
+        ),
+    )
+    sector_name, sector_color, sector_note = ENTROPIC_COLORWHEEL[digest[0] % len(ENTROPIC_COLORWHEEL)]
+    base_days = 18 + (digest[2] % 28)
+    if entropic_gain >= 0.78:
+        base_days = max(7, base_days - 6)
+    elif entropic_gain <= 0.35:
+        base_days = min(52, base_days + 5)
+    jitter_minutes = 45 + (int.from_bytes(digest[3:5], "big") % (18 * 60))
+    next_rotation_epoch = time.time() + (base_days * 86400) + (jitter_minutes * 60)
+    next_rotation_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_rotation_epoch))
+    return normalize_vault_rotation_machine_state(
+        {
+            "generated_at": generated_at,
+            "reason": reason,
+            "entropic_gain": f"{entropic_gain:.3f}",
+            "colorwheel_sector": sector_name,
+            "colorwheel_color": sector_color,
+            "colorwheel_note": sector_note,
+            "rotation_window_days": str(base_days),
+            "rotation_jitter_minutes": str(jitter_minutes),
+            "next_rotation_at": next_rotation_at,
+            "seed_fingerprint": digest.hex()[:16],
+            "key_generation": detect_key_storage_generation(),
+        }
+    )
+
+
+def advance_vault_rotation_machine(
+    key: bytes,
+    reason: str,
+    *,
+    record_audit: bool = True,
+) -> Dict[str, str]:
+    dashboard_state: Dict[str, str]
+    dashboard_trail: List[Dict[str, str]]
+    try:
+        dashboard_state = load_dashboard_quantum_color_state(key)
+    except Exception:
+        dashboard_state = {}
+    try:
+        dashboard_trail = load_dashboard_quantum_color_trail(key)
+    except Exception:
+        dashboard_trail = []
+    state = build_vault_rotation_machine_state(
+        reason,
+        dashboard_state=dashboard_state,
+        dashboard_trail=dashboard_trail,
+    )
+    save_app_state_value(key, VAULT_ROTATION_MACHINE_STATE_KEY, json.dumps(state, sort_keys=True))
+    if record_audit:
+        audit_entries = load_vault_rotation_audit_log(key)
+        save_vault_rotation_audit_log(key, [state, *audit_entries])
+    save_vault_hardening_state(key)
+    return state
+
+
+def vault_rotation_status_line(state: Optional[Dict[str, str]]) -> str:
+    clean = normalize_vault_rotation_machine_state(state)
+    if not clean:
+        return "Entropic rotation machine: no encrypted schedule stored yet."
+    return (
+        "Entropic rotation machine: "
+        f"{clean.get('colorwheel_sector') or 'sector unknown'} "
+        f"{clean.get('colorwheel_color') or ''} | "
+        f"gain={clean.get('entropic_gain') or '0.000'} | "
+        f"next={clean.get('next_rotation_at') or 'unknown'} | "
+        f"reason={clean.get('reason') or 'unknown'}"
+    ).strip()
+
+
 def fetch_history_page(
     key: bytes,
     *,
@@ -1218,7 +1707,7 @@ def fetch_history_page(
     rows: List[Tuple[int, str, str, str]] = []
 
     with unlocked_db_path(key) as temp_db:
-        with sqlite3.connect(temp_db) as db:
+        with connect_sqlite(temp_db) as db:
             terms = history_search_terms(search_value)
             where_clause, params = history_search_where_clause(terms)
             if session_id is not None:
@@ -1837,25 +2326,44 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
         metrics_line = "sys_metrics: disabled"
 
     system_text = (
-        "You are a precise road risk classifier. Treat blank fields as unknown rather than inventing defaults. "
-        "Return only one word: Low, Medium, or High."
+        "You are a Hypertime Nanobot specialized Road Risk Classification AI trained to evaluate real-world driving scenes.\n"
+        "Analyze and triple-check the environmental and sensor data before deciding the overall road risk level.\n"
+        "Treat blank or missing fields as unknown rather than inventing defaults.\n"
+        "Think through the scene internally, but do not reveal your reasoning.\n"
+        "Your reply must be exactly one word: Low, Medium, or High."
     )
     user_text = (
-        "Analyze the driving scene and return exactly one word: Low, Medium, or High.\n\n"
-        "Blank fields are intentional and must stay unknown.\n"
-        f"Location: {data.get('location', '')}\n"
-        f"Road type: {data.get('road_type', '')}\n"
-        f"Weather: {data.get('weather', '')}\n"
-        f"Traffic: {data.get('traffic', '')}\n"
-        f"Obstacles: {data.get('obstacles', '')}\n"
-        f"Sensor notes: {data.get('sensor_notes', '')}\n"
+        "Analyze the following driving scene and return exactly one word.\n\n"
+        "[tuning]\n"
+        "Scene details:\n"
+        f"Location: {data.get('location', '') or 'unspecified location'}\n"
+        f"Road type: {data.get('road_type', '') or 'unknown'}\n"
+        f"Weather: {data.get('weather', '') or 'unknown'}\n"
+        f"Traffic: {data.get('traffic', '') or 'unknown'}\n"
+        f"Obstacles: {data.get('obstacles', '') or 'none'}\n"
+        f"Sensor notes: {data.get('sensor_notes', '') or 'none'}\n"
         f"{metrics_line}\n"
-        f"Quantum State: {entropy_text}\n\n"
-        "Rules:\n"
-        "- Evaluate visibility, traction, traffic, and obstacles.\n"
-        "- If sensor integrity seems unreliable, lean conservative.\n"
-        "- Return exactly one word.\n"
-        "- Valid outputs: Low, Medium, High.\n"
+        f"Quantum State: {entropy_text}\n"
+        "[/tuning]\n\n"
+        "Follow these strict rules when forming your decision:\n"
+        "- Think through all scene factors internally but do not show reasoning.\n"
+        "- Evaluate surface, visibility, weather, traffic, and obstacles holistically.\n"
+        "- Optionally use the system entropic signal to bias your internal confidence slightly.\n"
+        "- Choose only one risk level that best fits the entire situation.\n"
+        "- If sensor integrity anomalies are detected, bias toward higher risk.\n"
+        "- Output exactly one word, with no punctuation or labels.\n"
+        "- The valid outputs are only: Low, Medium, High.\n\n"
+        "[action]\n"
+        "1) Normalize sensor inputs to comparable scales.\n"
+        "2) Compare environmental cues, traffic density, and obstacle severity together.\n"
+        "3) Map environmental risk cues to a discrete label using conservative thresholds.\n"
+        "4) If sensor integrity anomalies are detected, bias toward higher risk.\n"
+        "5) PUNKD: detect key tokens and locally adjust attention and confidence weighting toward safety-critical cues.\n"
+        "6) Do not output internal reasoning or diagnostics; only return the single-word label.\n"
+        "[/action]\n\n"
+        "[replytemplate]\n"
+        "Low | Medium | High\n"
+        "[/replytemplate]"
     )
     return system_text, user_text
 
@@ -1901,7 +2409,7 @@ def load_settings() -> Dict[str, Any]:
 
 
 def save_settings(settings: Dict[str, Any]) -> None:
-    SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    _write_text_atomic(SETTINGS_PATH, json.dumps(settings, indent=2), encoding="utf-8")
 
 
 def _status_report(reporter: Optional[Callable[[str, Any], None]], kind: str, payload: Any) -> None:
@@ -1911,13 +2419,14 @@ def _status_report(reporter: Optional[Callable[[str, Any], None]], kind: str, pa
 
 @contextmanager
 def unlocked_model_path(key: bytes):
-    safe_cleanup([LEGACY_RUNTIME_MODEL_PATH])
+    safe_cleanup([LEGACY_RUNTIME_MODEL_PATH, RUNTIME_MODEL_PATH])
     if ENCRYPTED_MODEL.exists():
-        decrypt_file(ENCRYPTED_MODEL, RUNTIME_MODEL_PATH, key)
+        temp_model = _temp_model_path()
+        decrypt_file(ENCRYPTED_MODEL, temp_model, key)
         try:
-            yield RUNTIME_MODEL_PATH
+            yield temp_model
         finally:
-            safe_cleanup([RUNTIME_MODEL_PATH])
+            safe_cleanup([temp_model])
         return
 
     if MODEL_PATH.exists():
@@ -2215,7 +2724,7 @@ def download_and_encrypt_model(key: bytes, reporter: Optional[Callable[[str, Any
         sha = download_model_httpx(MODEL_REPO + MODEL_FILE, plain_temp, expected_sha=EXPECTED_HASH, progress_callback=progress)
         _status_report(reporter, "status", "Encrypting the verified model for safe local storage...")
         encrypt_file(plain_temp, encrypted_temp, key)
-        encrypted_temp.replace(ENCRYPTED_MODEL)
+        _atomic_replace(encrypted_temp, ENCRYPTED_MODEL)
         safe_cleanup([MODEL_PATH])
         _status_report(reporter, "status", "Model ready. The encrypted vault is sealed again.")
         return sha
@@ -2229,7 +2738,7 @@ def encrypt_existing_plaintext_model(key: bytes, delete_plaintext: bool = True) 
     temp_encrypted = _temp_encrypted_model_path()
     try:
         encrypt_file(MODEL_PATH, temp_encrypted, key)
-        temp_encrypted.replace(ENCRYPTED_MODEL)
+        _atomic_replace(temp_encrypted, ENCRYPTED_MODEL)
         if delete_plaintext:
             safe_cleanup([MODEL_PATH])
     finally:
@@ -2244,7 +2753,7 @@ def verify_model_hash(key: bytes) -> Tuple[str, bool]:
 
 def reencrypt_assets(old_key: bytes, new_key: bytes, reporter: Optional[Callable[[str, Any], None]] = None) -> None:
     temp_plain_model = _temp_model_path()
-    temp_plain_db = _temp_db_path()
+    db_workspace, temp_plain_db = _temp_db_workspace()
     temp_encrypted_model = _temp_encrypted_model_path()
     temp_encrypted_db = _temp_encrypted_db_path()
 
@@ -2261,25 +2770,55 @@ def reencrypt_assets(old_key: bytes, new_key: bytes, reporter: Optional[Callable
             encrypt_file(temp_plain_db, temp_encrypted_db, new_key)
 
         if temp_encrypted_model.exists():
-            temp_encrypted_model.replace(ENCRYPTED_MODEL)
+            _atomic_replace(temp_encrypted_model, ENCRYPTED_MODEL)
         if temp_encrypted_db.exists():
-            temp_encrypted_db.replace(DB_PATH)
+            _atomic_replace(temp_encrypted_db, DB_PATH)
     finally:
-        safe_cleanup([temp_plain_model, temp_plain_db, temp_encrypted_model, temp_encrypted_db])
+        cleanup_sqlite_sidecars(temp_plain_db)
+        safe_cleanup([temp_plain_model, temp_encrypted_model, temp_encrypted_db, db_workspace])
 
 
 def migrate_legacy_key_to_passphrase(password: str, reporter: Optional[Callable[[str, Any], None]] = None) -> bytes:
     old_key = read_legacy_key()
-    salt, new_key = derive_key_from_passphrase(password)
+    new_key = os.urandom(KEY_FILE_MASTER_BYTES)
+    wrapped_bytes = wrap_master_key_for_passphrase(password, new_key)
+    _write_pending_key_file(wrapped_bytes)
+    try:
+        reencrypt_assets(old_key, new_key, reporter=reporter)
+        _write_key_file(wrapped_bytes)
+        safe_cleanup([KEY_ROTATION_PENDING_PATH])
+        init_db(new_key)
+        advance_vault_rotation_machine(new_key, "legacy_raw_migration", record_audit=True)
+        return new_key
+    except Exception:
+        raise
+
+
+def migrate_insecure_passphrase_key_to_wrapped(
+    password: str,
+    reporter: Optional[Callable[[str, Any], None]] = None,
+) -> bytes:
+    old_key = unlock_key_with_passphrase(password)
+    new_key = os.urandom(KEY_FILE_MASTER_BYTES)
+    wrapped_bytes = wrap_master_key_for_passphrase(password, new_key)
+    _write_pending_key_file(wrapped_bytes)
     reencrypt_assets(old_key, new_key, reporter=reporter)
-    _write_key_file(salt + new_key)
+    _write_key_file(wrapped_bytes)
+    safe_cleanup([KEY_ROTATION_PENDING_PATH])
+    init_db(new_key)
+    advance_vault_rotation_machine(new_key, "wrapped_master_upgrade", record_audit=True)
     return new_key
 
 
 def rotate_to_new_passphrase(current_key: bytes, password: str, reporter: Optional[Callable[[str, Any], None]] = None) -> bytes:
-    salt, new_key = derive_key_from_passphrase(password)
+    new_key = os.urandom(KEY_FILE_MASTER_BYTES)
+    wrapped_bytes = wrap_master_key_for_passphrase(password, new_key)
+    _write_pending_key_file(wrapped_bytes)
     reencrypt_assets(current_key, new_key, reporter=reporter)
-    _write_key_file(salt + new_key)
+    _write_key_file(wrapped_bytes)
+    safe_cleanup([KEY_ROTATION_PENDING_PATH])
+    init_db(new_key)
+    advance_vault_rotation_machine(new_key, "password_rotation", record_audit=True)
     return new_key
 
 
@@ -2302,7 +2841,7 @@ def storage_summary(key: Optional[bytes]) -> Dict[str, str]:
     else:
         try:
             with unlocked_db_path(key) as temp_db:
-                with sqlite3.connect(temp_db) as db:
+                with connect_sqlite(temp_db) as db:
                     history_count = str(int(db.execute("SELECT COUNT(*) FROM history").fetchone()[0]))
                     conversation_count = str(
                         int(
@@ -2323,19 +2862,17 @@ def storage_summary(key: Optional[bytes]) -> Dict[str, str]:
         "plaintext_size": plaintext_size,
         "history_count": history_count,
         "conversation_count": conversation_count,
-        "key_mode": detect_key_mode(),
+        "key_mode": detect_key_storage_generation(),
     }
 
 
 def cleanup_worker_artifacts(*, remove_worker_caches: bool = False) -> None:
     safe_cleanup([RUNTIME_MODEL_PATH, LEGACY_RUNTIME_MODEL_PATH])
-    for pattern in ("history_*.db",):
+    for pattern in ("history_*.db", ".history_*", ".vault_history_*"):
         for path in DB_PATH.parent.glob(pattern):
-            try:
-                if path.is_symlink() or path.is_file():
-                    path.unlink()
-            except Exception:
-                pass
+            safe_cleanup([path])
+    for path in SECURE_TEMP_ROOT.glob("*"):
+        safe_cleanup([path])
 
     if not remove_worker_caches:
         return
@@ -2560,7 +3097,7 @@ class StartupPasswordDialog(DialogBase):
             return "Recommended: migrate to a password-protected vault now. Existing encrypted data will be re-wrapped safely."
         if self.mode == "invalid":
             return "The current key file is too short to decrypt anything. Remove it only if you know the vault data is disposable."
-        return "Passphrase mode detected. The window unlocks only after the stored key is derived from your password."
+        return "Passphrase mode detected. Wrapped-master vaults keep the actual encryption key out of the key file and upgrade older layouts on unlock."
 
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
@@ -2605,6 +3142,24 @@ class StartupPasswordDialog(DialogBase):
                 key = unlock_key_with_passphrase(password)
             except Exception as exc:
                 self.error_var.set(str(exc))
+                return
+            if detect_key_storage_generation() == "derived_key_v1":
+                self._set_busy(True)
+
+                def on_success(upgraded_key: bytes) -> None:
+                    self.app.complete_unlock(upgraded_key, "passphrase")
+                    self.destroy()
+
+                def on_error(exc: Exception) -> None:
+                    self._set_busy(False)
+                    self.error_var.set(str(exc))
+
+                self.app.run_task(
+                    "Upgrading the vault key architecture to wrapped-master passphrase mode...",
+                    lambda reporter: migrate_insecure_passphrase_key_to_wrapped(password, reporter=reporter),
+                    on_success=on_success,
+                    on_error=on_error,
+                )
                 return
             self.app.complete_unlock(key, "passphrase")
             self.destroy()
@@ -2743,6 +3298,8 @@ class HumoidStudioApp(AppBase):
         self.change_current_password_var = tk.StringVar()
         self.change_new_password_var = tk.StringVar()
         self.change_confirm_password_var = tk.StringVar()
+        self.vault_rotation_status_var = tk.StringVar(value="Unlock the vault to generate an entropic rotation schedule.")
+        self.vault_hardening_status_var = tk.StringVar(value="Unlock the vault to inspect active hardening features.")
 
         self.title("Humoids")
         self.geometry("1420x940")
@@ -2978,15 +3535,28 @@ class HumoidStudioApp(AppBase):
         self.current_session_started_at = ""
         self.current_session_title = ""
         self.session_title_requested = False
-        self.key_status_var.set(f"Key: {'Passphrase' if key_mode == 'passphrase' else 'Legacy Raw'}")
+        key_generation = detect_key_storage_generation()
+        key_label = {
+            "wrapped_master_v2": "Passphrase v2",
+            "derived_key_v1": "Passphrase v1",
+            "legacy_raw": "Legacy Raw",
+        }.get(key_generation, "Locked")
+        self.key_status_var.set(f"Key: {key_label}")
         self.status_var.set("Studio unlocked. The vault is ready.")
         self.qid_mood_auto_requested_this_load = False
         self.set_action_state(True)
         try:
             init_db(key)
+            save_vault_hardening_state(key)
+            advance_vault_rotation_machine(key, "unlock_refresh", record_audit=False)
             self.load_chat_toolbar_state()
         except Exception as exc:
-            self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}")
+            recovery_note = (
+                " A pending key rotation file is present; if you were rotating the password, try the newer password."
+                if KEY_ROTATION_PENDING_PATH.exists()
+                else ""
+            )
+            self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}.{recovery_note}")
         self.refresh_dashboard()
         self.after(700, self.request_qid_mood_generation)
         self.after(900, self.offer_first_model_download)
@@ -3302,6 +3872,30 @@ class HumoidStudioApp(AppBase):
         except Exception as exc:
             self.settings_dynamic_rag_status_var.set(f"Dynamic Support RAG status unavailable: {sanitize_text(exc, max_chars=90)}")
 
+    def update_vault_security_status(self) -> None:
+        if self.key is None:
+            self.vault_rotation_status_var.set("Unlock the vault to generate an entropic rotation schedule.")
+            self.vault_hardening_status_var.set("Unlock the vault to inspect active hardening features.")
+            return
+        try:
+            rotation_state = load_vault_rotation_machine_state(self.key)
+            if not rotation_state:
+                rotation_state = advance_vault_rotation_machine(self.key, "ui_refresh", record_audit=False)
+            self.vault_rotation_status_var.set(vault_rotation_status_line(rotation_state))
+        except Exception as exc:
+            self.vault_rotation_status_var.set(f"Rotation machine unavailable: {sanitize_text(exc, max_chars=90)}")
+        try:
+            hardening_state = load_vault_hardening_state(self.key)
+            if not hardening_state:
+                hardening_state = save_vault_hardening_state(self.key)
+            self.vault_hardening_status_var.set(
+                "Hardening features: "
+                + (hardening_state.get("features", "unavailable") or "unavailable")
+                + "."
+            )
+        except Exception as exc:
+            self.vault_hardening_status_var.set(f"Hardening state unavailable: {sanitize_text(exc, max_chars=90)}")
+
     def apply_chat_font_size(self, _value: Optional[float] = None) -> None:
         size = self.chat_font_size()
         self.update_chat_font_label()
@@ -3444,11 +4038,11 @@ class HumoidStudioApp(AppBase):
                     _, result, callback = event
                     self.set_busy(False)
                     self.update_inference_backend_status()
-                    self.refresh_dashboard()
                     if callback:
                         callback(result)
                     elif self.status_var.get() == "":
                         self.status_var.set("Task completed.")
+                    self.refresh_dashboard()
 
                 elif kind == "success_no_refresh":
                     _, result, callback = event
@@ -5044,7 +5638,10 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         )
         ctk.CTkLabel(
             security,
-            text="Change the password protecting the encrypted model and chat history.",
+            text=(
+                "Change the password protecting the encrypted model and chat history. "
+                "The vault now uses a wrapped master key, atomic re-encryption, and an encrypted entropic rotation schedule."
+            ),
             font=self.body_font,
             text_color=PALETTE["muted"],
             wraplength=500,
@@ -5124,6 +5721,42 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         lock_button = self.make_button(security, "Lock Studio", self.lock_studio, 5, width=140)
         lock_button.pack(anchor="w", padx=20, pady=(0, 20))
         self.register_action(lock_button)
+
+        ctk.CTkLabel(
+            security,
+            text="Entropic Rotation Machine",
+            font=self.small_font,
+            text_color=PALETTE["accent_gold"],
+        ).pack(anchor="w", padx=20, pady=(0, 6))
+
+        rotation_button = self.make_button(
+            security,
+            "Advance Rotation Machine",
+            self.advance_rotation_machine_action,
+            4,
+            width=230,
+            height=40,
+        )
+        rotation_button.pack(anchor="w", padx=20, pady=(0, 10))
+        self.register_action(rotation_button)
+
+        ctk.CTkLabel(
+            security,
+            textvariable=self.vault_rotation_status_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=500,
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        ctk.CTkLabel(
+            security,
+            textvariable=self.vault_hardening_status_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=500,
+        ).pack(anchor="w", padx=20, pady=(0, 18))
 
     def configure_textbox_tags(self, textbox: ctk.CTkTextbox, *, base_size: Optional[int] = None) -> None:
         try:
@@ -5421,20 +6054,33 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 self.recent_sessions_var.set("Recent sessions unavailable.")
         else:
             self.render_recent_session_tabs([])
+        self.update_vault_security_status()
         self.update_model_status_box(summary)
 
     def update_model_status_box(self, summary: Dict[str, str]) -> None:
+        try:
+            rotation_state = load_vault_rotation_machine_state(self.key) if self.key is not None else {}
+        except Exception:
+            rotation_state = {}
+        try:
+            hardening_state = load_vault_hardening_state(self.key) if self.key is not None else {}
+        except Exception:
+            hardening_state = {}
         lines = [
             f"Model state: {summary['model_state']}",
             f"Encrypted size: {summary['encrypted_size']}",
             f"Plaintext size: {summary['plaintext_size']}",
             f"Key mode: {summary['key_mode']}",
             f"Expected SHA256: {EXPECTED_HASH}",
+            f"Rotation machine: {vault_rotation_status_line(rotation_state)}",
+            f"Hardening: {hardening_state.get('features', 'locked') or 'locked'}",
             "",
             "Safety notes:",
+            "- The passphrase file wraps a random master key instead of storing the live vault key directly.",
+            "- Encrypted vault writes land in temporary files and then commit with atomic replace.",
             "- Runtime model access uses a temporary unlocked file when the encrypted vault exists.",
-            "- Chat history lives in an encrypted SQLite file and is re-sealed after each read or write.",
-            "- Password changes re-encrypt the model vault and history vault before the key file is replaced.",
+            "- Chat history lives in an encrypted SQLite file and uses a private temp workspace with in-memory SQLite temp storage.",
+            "- Password changes re-encrypt the model vault and history vault before the wrapped key file is replaced.",
         ]
         self.model_status_box.configure(state="normal")
         self.model_status_box.delete("1.0", "end")
@@ -6042,6 +6688,24 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             f"Support RAG: {'on' if self.settings_data['enable_dynamic_support_rag'] else 'off'}."
         )
 
+    def advance_rotation_machine_action(self) -> None:
+        if not self.ensure_unlocked():
+            return
+
+        def on_success(state: Dict[str, str]) -> None:
+            self.update_vault_security_status()
+            self.status_var.set(
+                "Rotation machine advanced. "
+                + (state.get("colorwheel_sector", "entropic sector"))
+                + f" scheduled next review for {state.get('next_rotation_at', 'unknown')}."
+            )
+
+        self.run_task(
+            "Advancing the entropic key rotation machine...",
+            lambda reporter: advance_vault_rotation_machine(self.key, "manual_advance", record_audit=True),
+            on_success=on_success,
+        )
+
     def change_password_action(self) -> None:
         if not self.ensure_unlocked():
             return
@@ -6070,10 +6734,11 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         def on_success(new_key: bytes) -> None:
             self.key = new_key
             self.key_mode = "passphrase"
-            self.key_status_var.set("Key: Passphrase")
+            self.key_status_var.set("Key: Passphrase v2")
             self.change_current_password_var.set("")
             self.change_new_password_var.set("")
             self.change_confirm_password_var.set("")
+            self.update_vault_security_status()
             self.status_var.set("Vault password updated and encrypted assets were rewrapped safely.")
 
         self.run_task(
@@ -6096,9 +6761,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.hash_status_var.set("Hash: Not checked")
         self.chat_memory.clear()
         self.hide_chat_toolbar(persist=False)
+        self.vault_rotation_status_var.set("Unlock the vault to generate an entropic rotation schedule.")
+        self.vault_hardening_status_var.set("Unlock the vault to inspect active hardening features.")
         self.refresh_memory_preview()
         self.render_recent_session_tabs([])
         self.reset_qid_display()
+        self.update_model_status_box(storage_summary(None))
         self.set_action_state(False)
         self.open_startup_dialog()
 

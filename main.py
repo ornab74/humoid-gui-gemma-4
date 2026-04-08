@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 import hashlib
 import hmac
 import html
@@ -103,6 +104,16 @@ SQLITE_SIDECAREXTENSIONS = ("-journal", "-wal", "-shm")
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 HISTORY_PAGE_SIZE = 12
+CONTEXT_VECTOR_DIMENSIONS = 24
+CONTEXT_CHUNK_TARGET_CHARS = 420
+CONTEXT_CHUNK_OVERLAP_CHARS = 84
+CONTEXT_MEMORY_SURFACE_MAX_CHUNKS = 2
+CONTEXT_QUERY_MEMORY_TURNS = 3
+CONTEXT_RETRIEVAL_LIMIT = 6
+CONTEXT_RETRIEVAL_SAME_SESSION_CANDIDATES = 140
+CONTEXT_RETRIEVAL_GLOBAL_CANDIDATES = 180
+CONTEXT_RETRIEVAL_SURFACE_CHAR_BUDGET = 2600
+CONTEXT_RETRIEVAL_BACKFILL_LIMIT = 72
 CHAT_TOOLBAR_STATE_KEY = "chat_toolbar_visible"
 DYNAMIC_SUPPORT_RAG_HISTORY_KEY = "dynamic_support_rag_history"
 DASHBOARD_QUANTUM_COLOR_STATE_KEY = "dashboard_quantum_color_state"
@@ -371,6 +382,225 @@ def sanitize_text(value: Any, *, max_chars: int = 20000) -> str:
 def normalize_setting_choice(value: Any, options: List[str], default: str) -> str:
     clean_value = sanitize_text(value, max_chars=80).strip()
     return clean_value if clean_value in options else default
+
+
+def clamp_float(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def normalize_text_for_vector_space(value: Any, *, max_chars: int = 16000) -> str:
+    text = sanitize_text(value, max_chars=max_chars).replace("\r\n", "\n").replace("\r", "\n").strip().lower()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def text_vector_tokens(value: Any, *, max_chars: int = 16000) -> List[str]:
+    text = normalize_text_for_vector_space(value, max_chars=max_chars)
+    tokens = re.findall(r"[a-z0-9_./:+#-]+", text)
+    return tokens if tokens else ([text] if text else [])
+
+
+def normalize_float_vector(values: List[float]) -> List[float]:
+    if not values:
+        return []
+    magnitude = math.sqrt(sum(float(value) * float(value) for value in values))
+    if magnitude <= 1e-12:
+        return [0.0 for _ in values]
+    return [float(value) / magnitude for value in values]
+
+
+def serialize_float_vector(values: List[float]) -> str:
+    return json.dumps([round(float(value), 6) for value in values], separators=(",", ":"))
+
+
+def deserialize_float_vector(value: Any, *, dimensions: int = 0) -> List[float]:
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except Exception:
+        parsed = []
+    if not isinstance(parsed, list):
+        parsed = []
+    vector: List[float] = []
+    for item in parsed:
+        try:
+            vector.append(float(item))
+        except Exception:
+            vector.append(0.0)
+    if dimensions > 0:
+        if len(vector) < dimensions:
+            vector.extend([0.0] * (dimensions - len(vector)))
+        elif len(vector) > dimensions:
+            vector = vector[:dimensions]
+    return vector
+
+
+def cosine_similarity(left: List[float], right: List[float]) -> float:
+    if not left or not right:
+        return 0.0
+    size = min(len(left), len(right))
+    if size <= 0:
+        return 0.0
+    return clamp_float(sum(float(left[index]) * float(right[index]) for index in range(size)), -1.0, 1.0)
+
+
+def compact_text_excerpt(value: Any, *, max_chars: int = 240) -> str:
+    text = sanitize_text(value, max_chars=max_chars * 3).replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def chunk_text_for_context(
+    value: Any,
+    *,
+    target_chars: int = CONTEXT_CHUNK_TARGET_CHARS,
+    overlap_chars: int = CONTEXT_CHUNK_OVERLAP_CHARS,
+) -> List[str]:
+    text = sanitize_text(value, max_chars=32000).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    if len(text) <= target_chars:
+        return [text]
+
+    chunks: List[str] = []
+    units = [unit.strip() for unit in re.split(r"\n{2,}|(?<=[.!?])\s+", text) if unit and unit.strip()]
+    current = ""
+
+    def flush_current() -> None:
+        nonlocal current
+        clean = current.strip()
+        if clean and (not chunks or chunks[-1] != clean):
+            chunks.append(clean)
+        current = ""
+
+    for unit in units:
+        if len(unit) > target_chars:
+            flush_current()
+            start = 0
+            while start < len(unit):
+                end = min(len(unit), start + target_chars)
+                if end < len(unit):
+                    boundary = unit.rfind(" ", start + max(40, target_chars // 2), min(len(unit), end + 40))
+                    if boundary > start + 40:
+                        end = boundary
+                piece = unit[start:end].strip()
+                if piece and (not chunks or chunks[-1] != piece):
+                    chunks.append(piece)
+                if end >= len(unit):
+                    break
+                start = max(end - overlap_chars, start + 1)
+                while start < len(unit) and unit[start].isspace():
+                    start += 1
+            continue
+
+        proposed = unit if not current else f"{current}\n{unit}"
+        if len(proposed) <= target_chars:
+            current = proposed
+            continue
+
+        flush_current()
+        current = unit
+
+    flush_current()
+    return chunks if chunks else [text[:target_chars].strip()]
+
+
+def choose_surface_chunks(chunks: List[str], *, max_chunks: int = CONTEXT_MEMORY_SURFACE_MAX_CHUNKS) -> List[Tuple[int, str]]:
+    if not chunks:
+        return []
+    if len(chunks) <= max_chunks:
+        return list(enumerate(chunks, start=1))
+    selected = [(1, chunks[0]), (len(chunks), chunks[-1])]
+    deduped: List[Tuple[int, str]] = []
+    seen: set[Tuple[int, str]] = set()
+    for chunk_index, chunk in selected:
+        signature = (chunk_index, chunk)
+        if signature not in seen:
+            seen.add(signature)
+            deduped.append((chunk_index, chunk))
+    return deduped
+
+
+def text_to_semantic_vector(text: Any, *, dimensions: int = CONTEXT_VECTOR_DIMENSIONS) -> List[float]:
+    normalized = normalize_text_for_vector_space(text, max_chars=16000)
+    tokens = text_vector_tokens(normalized, max_chars=16000)
+    if not tokens:
+        tokens = ["<empty>"]
+
+    vector = [0.0] * dimensions
+    for token_index, token in enumerate(tokens[:1024]):
+        digest = hashlib.sha256(f"{token_index % 31}:{token}".encode("utf-8")).digest()
+        weight = 1.0 + (min(len(token), 24) / 24.0)
+        for dimension in range(dimensions):
+            amplitude = 0.35 + (digest[dimension % len(digest)] / 255.0)
+            sign = 1.0 if digest[(dimension + 11) % len(digest)] % 2 == 0 else -1.0
+            vector[dimension] += sign * amplitude * weight
+
+    order_digest = hashlib.sha256(("||".join(tokens[:64]) or normalized).encode("utf-8")).digest()
+    for dimension in range(dimensions):
+        vector[dimension] += (((order_digest[dimension % len(order_digest)] / 255.0) - 0.5) * 2.0) * 0.6
+
+    return normalize_float_vector(vector)
+
+
+def semantic_vector_to_colorvector(text: Any, semantic_vector: Optional[List[float]] = None) -> Tuple[List[float], str]:
+    normalized = normalize_text_for_vector_space(text, max_chars=16000)
+    semantic = semantic_vector or text_to_semantic_vector(normalized)
+    if not semantic:
+        semantic = [0.0] * CONTEXT_VECTOR_DIMENSIONS
+
+    band_r = sum(abs(value) for value in semantic[0::3]) / max(1, len(semantic[0::3]))
+    band_g = sum(abs(value) for value in semantic[1::3]) / max(1, len(semantic[1::3]))
+    band_b = sum(abs(value) for value in semantic[2::3]) / max(1, len(semantic[2::3]))
+    length_ratio = clamp_float(len(normalized) / 2200.0)
+    digit_ratio = clamp_float(len(re.findall(r"\d", normalized)) / max(1, len(normalized)))
+    newline_ratio = clamp_float(normalized.count("\n") / max(1, len(normalized) / 80.0))
+    alpha_ratio = clamp_float(len(re.findall(r"[a-z]", normalized)) / max(1, len(normalized)))
+
+    red = clamp_float(0.14 + (0.68 * band_r) + (0.12 * digit_ratio) + (0.06 * length_ratio))
+    green = clamp_float(0.14 + (0.68 * band_g) + (0.10 * alpha_ratio) + (0.08 * (1.0 - digit_ratio)))
+    blue = clamp_float(0.14 + (0.68 * band_b) + (0.12 * newline_ratio) + (0.06 * (1.0 - length_ratio)))
+    hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
+    colorvector = [
+        round(red, 6),
+        round(green, 6),
+        round(blue, 6),
+        round(float(hue), 6),
+        round(float(saturation), 6),
+        round(float(value), 6),
+    ]
+    color_hex = f"#{int(red * 255):02x}{int(green * 255):02x}{int(blue * 255):02x}"
+    return colorvector, color_hex
+
+
+def colorvector_similarity(left: List[float], right: List[float]) -> float:
+    left_vector = deserialize_float_vector(left, dimensions=6)
+    right_vector = deserialize_float_vector(right, dimensions=6)
+    if len(left_vector) < 6 or len(right_vector) < 6:
+        return 0.0
+
+    rgb_distance = math.sqrt(sum((left_vector[index] - right_vector[index]) ** 2 for index in range(3)) / 3.0)
+    hue_delta = abs(left_vector[3] - right_vector[3])
+    hue_delta = min(hue_delta, 1.0 - hue_delta)
+    hsv_distance = math.sqrt(
+        ((hue_delta**2) + ((left_vector[4] - right_vector[4]) ** 2) + ((left_vector[5] - right_vector[5]) ** 2))
+        / 3.0
+    )
+    return clamp_float(1.0 - ((rgb_distance * 0.55) + (hsv_distance * 0.45)))
+
+
+def build_context_query_text(user_text: str, memory: List[Tuple[str, str]], *, turns: int = CONTEXT_QUERY_MEMORY_TURNS) -> str:
+    lines = [sanitize_text(user_text, max_chars=5000).strip()]
+    recent = memory[-max(0, turns * 2) :]
+    if recent:
+        lines.append("")
+        lines.append("Recent dialogue anchor:")
+        for role, message in recent:
+            label = "user" if role == "user" else "assistant"
+            lines.append(f"{label}: {sanitize_text(message, max_chars=1200).strip()}")
+    return "\n".join(line for line in lines if line).strip()
 
 
 def render_markdown_for_display(value: Any, *, max_chars: int = 20000) -> str:
@@ -977,11 +1207,29 @@ def _ensure_plaintext_db_schema(db: sqlite3.Connection) -> None:
         "value TEXT, "
         "updated_at TEXT)"
     )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS context_chunks ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "history_id INTEGER NOT NULL, "
+        "session_id INTEGER, "
+        "role TEXT, "
+        "chunk_index INTEGER NOT NULL, "
+        "text_chunk TEXT, "
+        "text_hash TEXT, "
+        "semantic_vector TEXT, "
+        "color_vector TEXT, "
+        "color_hex TEXT, "
+        "created_at TEXT, "
+        "UNIQUE(history_id, role, chunk_index))"
+    )
     columns = {row[1] for row in db.execute("PRAGMA table_info(history)").fetchall()}
     if "session_id" not in columns:
         db.execute("ALTER TABLE history ADD COLUMN session_id INTEGER")
     db.execute("CREATE INDEX IF NOT EXISTS idx_history_session_id ON history(session_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_context_chunks_session_id ON context_chunks(session_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_context_chunks_history_id ON context_chunks(history_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_context_chunks_created_at ON context_chunks(created_at)")
 
     legacy_rows = db.execute(
         "SELECT id, timestamp, prompt FROM history WHERE session_id IS NULL ORDER BY id ASC LIMIT 200"
@@ -1138,13 +1386,266 @@ def fetch_session_chat_rows(key: bytes, session_id: int) -> Dict[str, Any]:
     }
 
 
+def build_context_chunk_records(
+    history_id: int,
+    session_id: Optional[int],
+    role: str,
+    text: str,
+    created_at: str,
+) -> List[Tuple[int, Optional[int], str, int, str, str, str, str, str, str]]:
+    clean_text = sanitize_text(text, max_chars=24000).strip()
+    if not clean_text:
+        return []
+
+    records: List[Tuple[int, Optional[int], str, int, str, str, str, str, str, str]] = []
+    for chunk_index, chunk in enumerate(chunk_text_for_context(clean_text), start=1):
+        semantic_vector = text_to_semantic_vector(chunk)
+        color_vector, color_hex = semantic_vector_to_colorvector(chunk, semantic_vector)
+        records.append(
+            (
+                history_id,
+                session_id,
+                role,
+                chunk_index,
+                chunk,
+                hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
+                serialize_float_vector(semantic_vector),
+                serialize_float_vector(color_vector),
+                color_hex,
+                created_at,
+            )
+        )
+    return records
+
+
+def index_history_row_context_chunks(
+    db: sqlite3.Connection,
+    history_id: int,
+    prompt: str,
+    response: str,
+    session_id: Optional[int],
+    created_at: str,
+) -> None:
+    db.execute("DELETE FROM context_chunks WHERE history_id = ?", (history_id,))
+    records = build_context_chunk_records(history_id, session_id, "user", prompt, created_at)
+    records.extend(build_context_chunk_records(history_id, session_id, "assistant", response, created_at))
+    if not records:
+        return
+    db.executemany(
+        "INSERT OR REPLACE INTO context_chunks ("
+        "history_id, session_id, role, chunk_index, text_chunk, text_hash, semantic_vector, color_vector, color_hex, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        records,
+    )
+
+
+def backfill_missing_context_chunks(
+    db: sqlite3.Connection,
+    *,
+    session_id: Optional[int] = None,
+    limit: int = CONTEXT_RETRIEVAL_BACKFILL_LIMIT,
+) -> int:
+    query = (
+        "SELECT h.id, h.timestamp, h.prompt, h.response, h.session_id "
+        "FROM history h "
+        "WHERE NOT EXISTS (SELECT 1 FROM context_chunks c WHERE c.history_id = h.id)"
+    )
+    params: List[Any] = []
+    if session_id is not None:
+        query += " AND h.session_id = ?"
+        params.append(session_id)
+    query += " ORDER BY h.id DESC LIMIT ?"
+    params.append(limit)
+    rows = db.execute(query, tuple(params)).fetchall()
+    for history_id, created_at, prompt, response, row_session_id in rows:
+        index_history_row_context_chunks(
+            db,
+            int(history_id),
+            sanitize_text(prompt, max_chars=24000),
+            sanitize_text(response, max_chars=24000),
+            int(row_session_id) if row_session_id is not None else None,
+            sanitize_text(created_at, max_chars=80) or time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    return len(rows)
+
+
+def build_context_increase_surface(
+    key: bytes,
+    user_text: str,
+    memory: List[Tuple[str, str]],
+    *,
+    session_id: Optional[int] = None,
+) -> str:
+    query_text = build_context_query_text(user_text, memory)
+    if not query_text:
+        return ""
+
+    query_semantic = text_to_semantic_vector(query_text)
+    query_colorvector, query_color_hex = semantic_vector_to_colorvector(query_text, query_semantic)
+    recent_excerpts = {
+        compact_text_excerpt(message, max_chars=220)
+        for _role, message in memory[-max(0, CONTEXT_QUERY_MEMORY_TURNS * 2) :]
+        if message
+    }
+
+    with unlocked_db_path(key) as temp_db:
+        with connect_sqlite(temp_db) as db:
+            same_session_backfill = 0
+            if session_id is not None:
+                same_session_backfill = backfill_missing_context_chunks(
+                    db,
+                    session_id=session_id,
+                    limit=CONTEXT_RETRIEVAL_BACKFILL_LIMIT,
+                )
+            global_backfill = backfill_missing_context_chunks(
+                db,
+                limit=CONTEXT_RETRIEVAL_BACKFILL_LIMIT,
+            )
+            if same_session_backfill or global_backfill:
+                db.commit()
+
+            candidates: List[Tuple[Any, ...]] = []
+            if session_id is not None:
+                candidates.extend(
+                    db.execute(
+                        "SELECT history_id, session_id, role, chunk_index, text_chunk, text_hash, semantic_vector, color_vector, color_hex, created_at "
+                        "FROM context_chunks WHERE session_id = ? ORDER BY history_id DESC, chunk_index ASC LIMIT ?",
+                        (session_id, CONTEXT_RETRIEVAL_SAME_SESSION_CANDIDATES),
+                    ).fetchall()
+                )
+                candidates.extend(
+                    db.execute(
+                        "SELECT history_id, session_id, role, chunk_index, text_chunk, text_hash, semantic_vector, color_vector, color_hex, created_at "
+                        "FROM context_chunks WHERE session_id IS NULL OR session_id != ? "
+                        "ORDER BY history_id DESC, chunk_index ASC LIMIT ?",
+                        (session_id, CONTEXT_RETRIEVAL_GLOBAL_CANDIDATES),
+                    ).fetchall()
+                )
+            else:
+                candidates.extend(
+                    db.execute(
+                        "SELECT history_id, session_id, role, chunk_index, text_chunk, text_hash, semantic_vector, color_vector, color_hex, created_at "
+                        "FROM context_chunks ORDER BY history_id DESC, chunk_index ASC LIMIT ?",
+                        (CONTEXT_RETRIEVAL_GLOBAL_CANDIDATES,),
+                    ).fetchall()
+                )
+
+    if not candidates:
+        return ""
+
+    max_history_id = max(int(row[0]) for row in candidates if row and row[0] is not None) or 1
+    seen_signatures: set[str] = set()
+    scored_hits: List[Dict[str, Any]] = []
+    for row in candidates:
+        history_id = int(row[0])
+        row_session_id = int(row[1]) if row[1] is not None else None
+        role = sanitize_text(row[2], max_chars=40).strip() or "memory"
+        chunk_index = int(row[3])
+        text_chunk = sanitize_text(row[4], max_chars=2000).strip()
+        text_hash = sanitize_text(row[5], max_chars=80).strip()
+        semantic_vector = deserialize_float_vector(row[6], dimensions=CONTEXT_VECTOR_DIMENSIONS)
+        color_vector = deserialize_float_vector(row[7], dimensions=6)
+        color_hex = sanitize_text(row[8], max_chars=16).strip()
+        created_at = sanitize_text(row[9], max_chars=80).strip()
+        if not text_chunk:
+            continue
+
+        excerpt = compact_text_excerpt(text_chunk, max_chars=260)
+        if not excerpt:
+            continue
+        if excerpt in recent_excerpts and row_session_id == session_id:
+            continue
+
+        semantic_score = (cosine_similarity(query_semantic, semantic_vector) + 1.0) / 2.0
+        color_score = colorvector_similarity(query_colorvector, color_vector)
+        recency_bonus = 0.05 * (history_id / max_history_id)
+        session_bonus = 0.08 if session_id is not None and row_session_id == session_id else 0.0
+        total_score = clamp_float((semantic_score * 0.72) + (color_score * 0.28) + recency_bonus + session_bonus)
+        if total_score < 0.34 and semantic_score < 0.30 and color_score < 0.42:
+            continue
+
+        signature = text_hash or f"{history_id}:{role}:{chunk_index}"
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        scored_hits.append(
+            {
+                "total_score": total_score,
+                "semantic_score": semantic_score,
+                "color_score": color_score,
+                "history_id": history_id,
+                "session_id": row_session_id,
+                "role": role,
+                "chunk_index": chunk_index,
+                "excerpt": excerpt,
+                "color_hex": color_hex or "#000000",
+                "created_at": created_at,
+                "source": "same-session" if session_id is not None and row_session_id == session_id else "archive",
+            }
+        )
+
+    if not scored_hits:
+        return ""
+
+    scored_hits.sort(key=lambda item: (item["total_score"], item["semantic_score"], item["history_id"]), reverse=True)
+    selected_hits: List[Dict[str, Any]] = []
+    surface_chars = 0
+    seen_excerpts: set[str] = set()
+    for hit in scored_hits:
+        excerpt_signature = hit["excerpt"].lower()
+        if excerpt_signature in seen_excerpts:
+            continue
+        block = (
+            f"- {hit['source']} | role={hit['role']} | score={hit['total_score']:.2f} "
+            f"| semantic={hit['semantic_score']:.2f} | color={hit['color_score']:.2f} "
+            f"| colorvector={hit['color_hex']}\n  {hit['excerpt']}"
+        )
+        if selected_hits and surface_chars + len(block) > CONTEXT_RETRIEVAL_SURFACE_CHAR_BUDGET:
+            break
+        seen_excerpts.add(excerpt_signature)
+        selected_hits.append(hit)
+        surface_chars += len(block)
+        if len(selected_hits) >= CONTEXT_RETRIEVAL_LIMIT:
+            break
+
+    if not selected_hits:
+        return ""
+
+    same_session_hits = sum(1 for hit in selected_hits if hit["source"] == "same-session")
+    archive_hits = len(selected_hits) - same_session_hits
+    lines = [
+        "<context_increase_surface>",
+        "Use this retrieved long-range context only as supporting memory. The latest user message and recent conversation memory have priority.",
+        f"retrieval_engine: humoid local chunkdb + ColorVector field | query_colorvector={query_color_hex}",
+        f"retrieval_mix: same_session_hits={same_session_hits} | archive_hits={archive_hits} | selected_chunks={len(selected_hits)}",
+    ]
+    for hit in selected_hits:
+        lines.append(
+            f"- {hit['source']} | role={hit['role']} | score={hit['total_score']:.2f} "
+            f"| semantic={hit['semantic_score']:.2f} | color={hit['color_score']:.2f} "
+            f"| colorvector={hit['color_hex']}"
+        )
+        lines.append(f"  {hit['excerpt']}")
+    lines.append("</context_increase_surface>")
+    return "\n".join(lines)
+
+
 def log_interaction(prompt: str, response: str, key: bytes, session_id: Optional[int] = None) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with unlocked_db_path(key) as temp_db:
         with connect_sqlite(temp_db) as db:
-            db.execute(
+            cursor = db.execute(
                 "INSERT INTO history (timestamp, prompt, response, session_id) VALUES (?, ?, ?, ?)",
                 (timestamp, prompt, response, session_id),
+            )
+            history_id = int(cursor.lastrowid)
+            index_history_row_context_chunks(
+                db,
+                history_id,
+                sanitize_text(prompt, max_chars=24000),
+                sanitize_text(response, max_chars=24000),
+                session_id,
+                timestamp,
             )
             if session_id is not None:
                 db.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (timestamp, session_id))
@@ -2436,23 +2937,32 @@ def unlocked_model_path(key: bytes):
     raise FileNotFoundError("No model is available yet. Download and encrypt it from the Download Model tab first.")
 
 
-def build_chat_prompt(user_text: str, memory: List[Tuple[str, str]], turns: int = 6) -> str:
+def build_chat_prompt(
+    user_text: str,
+    memory: List[Tuple[str, str]],
+    turns: int = 6,
+    retrieved_surface: Optional[str] = None,
+) -> str:
     clean_user_text = sanitize_text(user_text)
     recent = memory[-max(0, turns * 2) :]
-    if not recent:
-        return "<latest_user_message>\n" + clean_user_text + "\n</latest_user_message>"
-
-    lines = [
-        "<conversation_memory>",
-        "Use this memory only as context. The latest user message below is the instruction to answer now.",
-    ]
-    for role, message in recent:
-        label = "User" if role == "user" else "Assistant"
-        lines.append(f"{label}: {sanitize_text(message, max_chars=4000)}")
+    lines: List[str] = []
+    if retrieved_surface:
+        lines.extend([retrieved_surface, ""])
+    if recent:
+        lines.extend(
+            [
+                "<conversation_memory>",
+                "Use this chunked recent memory only as context. The latest user message below is the instruction to answer now.",
+            ]
+        )
+        for role, message in recent:
+            label = "User" if role == "user" else "Assistant"
+            chunks = chunk_text_for_context(sanitize_text(message, max_chars=12000))
+            for chunk_index, chunk in choose_surface_chunks(chunks):
+                lines.append(f"{label} chunk {chunk_index}: {sanitize_text(chunk, max_chars=900)}")
+        lines.extend(["</conversation_memory>", ""])
     lines.extend(
         [
-            "</conversation_memory>",
-            "",
             "<latest_user_message>",
             clean_user_text,
             "</latest_user_message>",
@@ -2526,7 +3036,23 @@ def run_chat_request(
             native_allowed=native_image_allowed,
         )
 
-    compiled_prompt = build_chat_prompt(model_prompt, memory, turns=memory_turns)
+    context_increase_surface = ""
+    try:
+        context_increase_surface = build_context_increase_surface(
+            key,
+            clean_prompt,
+            memory,
+            session_id=session_id,
+        )
+    except Exception:
+        context_increase_surface = ""
+
+    compiled_prompt = build_chat_prompt(
+        model_prompt,
+        memory,
+        turns=memory_turns,
+        retrieved_surface=context_increase_surface,
+    )
     dynamic_support_rag_context = None
     dynamic_support_rag_surface_name = ""
     recent_dynamic_rag_surfaces: List[str] = []

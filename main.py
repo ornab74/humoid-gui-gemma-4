@@ -343,18 +343,6 @@ DEFAULT_SETTINGS = {
     "strict_prompt_formatting": True,
 }
 
-CHAT_PROMPT_SOFT_CHAR_BUDGET = 9000
-CHAT_PROMPT_HARD_CHAR_BUDGET = 5600
-CHAT_PROMPT_SOFT_TOKEN_BUDGET = 2800
-CHAT_PROMPT_HARD_TOKEN_BUDGET = 1700
-CHAT_PROMPT_RECENT_MESSAGE_LIMIT = 4
-CHAT_PROMPT_COMPACTION_WINDOW_MULTIPLIER = 4
-CHAT_PROMPT_OVERFLOW_MARKERS = (
-    "token ids are too long",
-    "maximum number of tokens allowed",
-    "invalid_argument",
-)
-
 GUI_READY = tk is not None and ctk is not None
 DialogBase = ctk.CTkToplevel if GUI_READY else object
 AppBase = ctk.CTk if GUI_READY else object
@@ -2448,270 +2436,17 @@ def unlocked_model_path(key: bytes):
     raise FileNotFoundError("No model is available yet. Download and encrypt it from the Download Model tab first.")
 
 
-def approximate_token_count(value: Any) -> int:
-    text = sanitize_text(value, max_chars=60000)
-    if not text:
-        return 0
-    char_estimate = math.ceil(len(text) / 4)
-    word_estimate = len(re.findall(r"\S+", text))
-    code_bonus = len(re.findall(r"[{}()[\];=]", text)) // 6
-    return max(char_estimate, word_estimate + code_bonus)
+def build_chat_prompt(user_text: str, memory: List[Tuple[str, str]], turns: int = 6) -> str:
+    clean_user_text = sanitize_text(user_text)
+    recent = memory[-max(0, turns * 2) :]
+    if not recent:
+        return "<latest_user_message>\n" + clean_user_text + "\n</latest_user_message>"
 
-
-def bounded_head_tail_text(
-    value: Any,
-    *,
-    max_chars: int,
-    separator: str = "\n...[compacted for local token budget]...\n",
-) -> str:
-    text = sanitize_text(value, max_chars=max_chars * 8).replace("\r\n", "\n").replace("\r", "\n").strip()
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= len(separator) + 40:
-        return text[:max_chars].rstrip()
-    head_chars = max(40, int(max_chars * 0.62))
-    tail_chars = max(28, max_chars - head_chars - len(separator))
-    head = text[:head_chars].rstrip()
-    tail = text[-tail_chars:].lstrip()
-    return head + separator + tail
-
-
-def compact_prompt_text(value: Any, *, max_chars: int = 240) -> str:
-    text = sanitize_text(value, max_chars=max_chars * 8).replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"```[A-Za-z0-9_-]*", " code ", text)
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
-    compact = " | ".join(lines[:10]).strip()
-    return bounded_head_tail_text(compact or text, max_chars=max_chars, separator=" ... ")
-
-
-def prompt_signal_signature(role: str, value: Any) -> str:
-    text = sanitize_text(value, max_chars=5000)
-    lowered = text.lower()
-    signals = ["ask" if role == "user" else "reply"]
-    if "traceback" in lowered or "error" in lowered or "exception" in lowered:
-        signals.append("error")
-    if any(marker in text for marker in ("```", "`", "def ", "class ", "import ", "SELECT ", "INSERT ", "UPDATE ")):
-        signals.append("code")
-    if "?" in text:
-        signals.append("question")
-    if re.search(r"(?:^|[\s(])/[A-Za-z0-9._/-]+", text) or re.search(r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+", text):
-        signals.append("path")
-    if any(word in lowered for word in ("fix", "implement", "update", "build", "rotate", "encrypt", "compact")):
-        signals.append("task")
-    unique_signals: List[str] = []
-    for signal_value in signals:
-        if signal_value not in unique_signals:
-            unique_signals.append(signal_value)
-    return "+".join(unique_signals[:4])
-
-
-def pair_conversation_turns(memory: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    turns: List[Tuple[str, str]] = []
-    index = 0
-    while index < len(memory):
-        role, message = memory[index]
-        if role == "user":
-            user_message = message
-            assistant_message = ""
-            if index + 1 < len(memory) and memory[index + 1][0] != "user":
-                assistant_message = memory[index + 1][1]
-                index += 1
-            turns.append((user_message, assistant_message))
-        else:
-            turns.append(("", message))
-        index += 1
-    return turns
-
-
-def sample_context_turns(turns: List[Tuple[str, str]], limit: int) -> List[Tuple[str, str]]:
-    if limit <= 0 or not turns:
-        return []
-    if len(turns) <= limit:
-        return turns
-    if limit == 1:
-        return [turns[-1]]
-    selected: List[Tuple[str, str]] = []
-    used_indexes: set[int] = set()
-    for slot in range(limit):
-        position = round(slot * (len(turns) - 1) / (limit - 1))
-        if position in used_indexes:
-            continue
-        used_indexes.add(position)
-        selected.append(turns[position])
-    if selected and selected[-1] != turns[-1]:
-        selected[-1] = turns[-1]
-    return selected
-
-
-def compact_turn_pair(user_text: str, assistant_text: str, *, max_chars: int) -> str:
-    parts = []
-    if user_text:
-        parts.append(f"user:{compact_prompt_text(user_text, max_chars=max(50, max_chars // 2))}")
-    if assistant_text:
-        parts.append(f"assistant:{compact_prompt_text(assistant_text, max_chars=max(50, max_chars // 2))}")
-    return bounded_head_tail_text(" || ".join(parts), max_chars=max_chars, separator=" ... ")
-
-
-def build_context_monitoring_window_surface(
-    *,
-    source_messages: int,
-    archived_messages: int,
-    live_messages: int,
-    candidate_text: str,
-    max_tokens: int,
-    compaction_mode: str,
-) -> str:
-    approx_tokens = approximate_token_count(candidate_text)
-    fill_ratio = 0.0 if max_tokens <= 0 else min(1.0, approx_tokens / max_tokens)
-    if fill_ratio >= 0.84:
-        pressure = "red"
-    elif fill_ratio >= 0.58:
-        pressure = "amber"
-    else:
-        pressure = "green"
-    lines = [
-        "<context_monitoring_window_surface_agent>",
-        "This agent monitors context fullness and triggers compaction only when required so inference stays fast.",
-        f"mode={compaction_mode} | pressure={pressure} | approx_tokens={approx_tokens}/{max_tokens}",
-        f"source_messages={source_messages} | archived_messages={archived_messages} | live_messages={live_messages}",
-        "priority_order=latest_user_message > recent_conversation_surface > intent_spine_surface > delta_echo_surface > continuous_context_ring_surface > morphing_genomic_context_matrix",
-        "</context_monitoring_window_surface_agent>",
-    ]
-    return "\n".join(lines)
-
-
-def summarize_turn_cluster(name: str, turns: List[Tuple[str, str]], *, max_chars: int) -> str:
-    if not turns:
-        return f"{name}=empty"
-    first_turn = compact_turn_pair(*turns[0], max_chars=max(70, max_chars // 3))
-    middle_turn = compact_turn_pair(*turns[len(turns) // 2], max_chars=max(70, max_chars // 3))
-    last_turn = compact_turn_pair(*turns[-1], max_chars=max(70, max_chars // 3))
-    summary = (
-        f"{name}[turns={len(turns)}]: "
-        f"entry={first_turn} | pivot={middle_turn} | exit={last_turn}"
-    )
-    return bounded_head_tail_text(summary, max_chars=max_chars, separator=" ... ")
-
-
-def build_continuous_context_ring_surface(memory: List[Tuple[str, str]], *, max_chars: int = 260) -> str:
-    turns = pair_conversation_turns(memory)
-    if not turns:
-        return ""
-    third = max(1, math.ceil(len(turns) / 3))
-    archive_turns = turns[:third]
-    bridge_turns = turns[third : third * 2]
-    live_turns = turns[third * 2 :]
-    lines = [
-        "<continuous_context_ring_surface>",
-        "Archive, bridge, and live rings keep long-range continuity while preserving inference speed.",
-        summarize_turn_cluster("archive", archive_turns, max_chars=max_chars),
-        summarize_turn_cluster("bridge", bridge_turns, max_chars=max_chars),
-        summarize_turn_cluster("live", live_turns, max_chars=max_chars),
-        "</continuous_context_ring_surface>",
-    ]
-    return "\n".join(lines)
-
-
-def build_intent_spine_surface(
-    memory: List[Tuple[str, str]],
-    *,
-    max_items: int = 5,
-    item_chars: int = 150,
-) -> str:
-    user_turns = [message for role, message in memory if role == "user" and sanitize_text(message, max_chars=5000).strip()]
-    if not user_turns:
-        return ""
-    sampled = sample_context_turns([(message, "") for message in user_turns], max_items)
-    lines = [
-        "<intent_spine_surface>",
-        "Long-run user goals sampled across the session so old intent survives compression.",
-    ]
-    for index, (user_text, _assistant_text) in enumerate(sampled, start=1):
-        lines.append(f"I{index:02d}|intent={compact_prompt_text(user_text, max_chars=item_chars)}")
-    lines.append("</intent_spine_surface>")
-    return "\n".join(lines)
-
-
-def build_delta_echo_surface(
-    memory: List[Tuple[str, str]],
-    *,
-    max_rows: int = 4,
-    row_chars: int = 160,
-) -> str:
-    turns = pair_conversation_turns(memory)
-    if len(turns) < 2:
-        return ""
-    transition_indexes = sample_context_turns([(str(index), "") for index in range(1, len(turns))], max_rows)
-    if not transition_indexes:
-        return ""
-    lines = [
-        "<delta_echo_surface>",
-        "Transition capsules preserve how the conversation changed without replaying every intermediate token.",
-    ]
-    for row_index, (index_text, _unused) in enumerate(transition_indexes, start=1):
-        turn_index = int(index_text)
-        previous_turn = turns[turn_index - 1]
-        current_turn = turns[turn_index]
-        previous_signal = f"{prompt_signal_signature('user', previous_turn[0])}->{prompt_signal_signature('assistant', previous_turn[1])}"
-        current_signal = f"{prompt_signal_signature('user', current_turn[0])}->{prompt_signal_signature('assistant', current_turn[1])}"
-        delta = (
-            f"from={compact_turn_pair(*previous_turn, max_chars=max(70, row_chars // 2))} "
-            f"to={compact_turn_pair(*current_turn, max_chars=max(70, row_chars // 2))}"
-        )
-        lines.append(
-            f"D{row_index:02d}|transition={previous_signal}->{current_signal}|echo={bounded_head_tail_text(delta, max_chars=row_chars, separator=' ... ')}"
-        )
-    lines.append("</delta_echo_surface>")
-    return "\n".join(lines)
-
-
-def build_morphing_genomic_context_matrix(
-    memory: List[Tuple[str, str]],
-    *,
-    max_rows: int = 6,
-    row_chars: int = 180,
-) -> str:
-    turns = pair_conversation_turns(memory)
-    sampled_turns = sample_context_turns(turns, max_rows)
-    if not sampled_turns:
-        return ""
-    lines = [
-        "<morphing_genomic_context_matrix>",
-        "Lossy turn capsules sampled across older context. Each row preserves ask/reply drift without replaying every token.",
-    ]
-    for index, (user_text, assistant_text) in enumerate(sampled_turns, start=1):
-        signal = f"{prompt_signal_signature('user', user_text)}->{prompt_signal_signature('assistant', assistant_text)}"
-        lines.append(f"G{index:02d}|signal={signal}|delta={compact_turn_pair(user_text, assistant_text, max_chars=row_chars)}")
-    lines.append("</morphing_genomic_context_matrix>")
-    return "\n".join(lines)
-
-
-def build_recent_conversation_surface(
-    memory: List[Tuple[str, str]],
-    *,
-    max_message_chars: int = 700,
-) -> str:
-    if not memory:
-        return ""
-    lines = [
-        "<recent_conversation_surface>",
-        "These are the newest turns preserved with higher fidelity.",
-    ]
-    for role, message in memory:
-        label = "User" if role == "user" else "Assistant"
-        lines.append(f"{label}: {bounded_head_tail_text(message, max_chars=max_message_chars)}")
-    lines.append("</recent_conversation_surface>")
-    return "\n".join(lines)
-
-
-def build_full_chat_prompt(user_text: str, memory: List[Tuple[str, str]]) -> str:
-    if not memory:
-        return "<latest_user_message>\n" + user_text + "\n</latest_user_message>"
     lines = [
         "<conversation_memory>",
         "Use this memory only as context. The latest user message below is the instruction to answer now.",
     ]
-    for role, message in memory:
+    for role, message in recent:
         label = "User" if role == "user" else "Assistant"
         lines.append(f"{label}: {sanitize_text(message, max_chars=4000)}")
     lines.extend(
@@ -2719,241 +2454,11 @@ def build_full_chat_prompt(user_text: str, memory: List[Tuple[str, str]]) -> str
             "</conversation_memory>",
             "",
             "<latest_user_message>",
-            user_text,
+            clean_user_text,
             "</latest_user_message>",
         ]
     )
     return "\n".join(lines)
-
-
-def build_compacted_chat_prompt(
-    user_text: str,
-    memory: List[Tuple[str, str]],
-    *,
-    turns: int,
-    max_chars: int,
-    max_tokens: int,
-    aggressive: bool = False,
-) -> str:
-    source_memory = list(memory)
-    profiles = [
-        {
-            "recent_messages": 4,
-            "recent_chars": 700,
-            "ring_chars": 260,
-            "intent_items": 5,
-            "intent_chars": 150,
-            "delta_rows": 4,
-            "delta_chars": 170,
-            "older_rows": 6,
-            "row_chars": 180,
-            "latest_chars": 2200,
-        },
-        {
-            "recent_messages": 3,
-            "recent_chars": 520,
-            "ring_chars": 220,
-            "intent_items": 4,
-            "intent_chars": 130,
-            "delta_rows": 3,
-            "delta_chars": 150,
-            "older_rows": 5,
-            "row_chars": 150,
-            "latest_chars": 1700,
-        },
-        {
-            "recent_messages": 2,
-            "recent_chars": 380,
-            "ring_chars": 180,
-            "intent_items": 4,
-            "intent_chars": 112,
-            "delta_rows": 3,
-            "delta_chars": 125,
-            "older_rows": 4,
-            "row_chars": 125,
-            "latest_chars": 1300,
-        },
-        {
-            "recent_messages": 1,
-            "recent_chars": 280,
-            "ring_chars": 150,
-            "intent_items": 3,
-            "intent_chars": 96,
-            "delta_rows": 2,
-            "delta_chars": 110,
-            "older_rows": 3,
-            "row_chars": 105,
-            "latest_chars": 1000,
-        },
-        {
-            "recent_messages": 0,
-            "recent_chars": 0,
-            "ring_chars": 120,
-            "intent_items": 2,
-            "intent_chars": 84,
-            "delta_rows": 1,
-            "delta_chars": 90,
-            "older_rows": 0,
-            "row_chars": 0,
-            "latest_chars": 850,
-        },
-    ]
-    if aggressive:
-        profiles = profiles[1:]
-
-    fallback_prompt = "<latest_user_message>\n" + bounded_head_tail_text(user_text, max_chars=850) + "\n</latest_user_message>"
-    for profile in profiles:
-        recent_count = min(profile["recent_messages"], len(source_memory))
-        recent_messages = source_memory[-recent_count:] if recent_count else []
-        older_messages = source_memory[:-recent_count] if recent_count else source_memory
-        sections: List[str] = []
-        intent_surface = build_intent_spine_surface(
-            older_messages,
-            max_items=profile["intent_items"],
-            item_chars=profile["intent_chars"],
-        )
-        if intent_surface:
-            sections.append(intent_surface)
-        delta_surface = build_delta_echo_surface(
-            older_messages,
-            max_rows=profile["delta_rows"],
-            row_chars=profile["delta_chars"],
-        )
-        if delta_surface:
-            sections.append(delta_surface)
-        ring_surface = build_continuous_context_ring_surface(older_messages, max_chars=profile["ring_chars"])
-        if ring_surface:
-            sections.append(ring_surface)
-        matrix_surface = ""
-        if profile["older_rows"] > 0 and older_messages:
-            matrix_surface = build_morphing_genomic_context_matrix(
-                older_messages,
-                max_rows=profile["older_rows"],
-                row_chars=profile["row_chars"],
-            )
-        if matrix_surface:
-            sections.append(matrix_surface)
-        recent_surface = build_recent_conversation_surface(
-            recent_messages,
-            max_message_chars=profile["recent_chars"],
-        )
-        if recent_surface:
-            sections.append(recent_surface)
-        sections.append(
-            "<latest_user_message>\n"
-            + bounded_head_tail_text(user_text, max_chars=profile["latest_chars"])
-            + "\n</latest_user_message>"
-        )
-        body = "\n\n".join(section for section in sections if section)
-        monitor_surface = build_context_monitoring_window_surface(
-            source_messages=len(source_memory),
-            archived_messages=len(older_messages),
-            live_messages=len(recent_messages),
-            candidate_text=body,
-            max_tokens=max_tokens,
-            compaction_mode="continuous_compacting_machine" if not aggressive else "continuous_compacting_machine_hard",
-        )
-        candidate = monitor_surface + "\n\n" + body
-        fallback_prompt = candidate
-        if len(candidate) <= max_chars and approximate_token_count(candidate) <= max_tokens:
-            return candidate
-    return fallback_prompt
-
-
-def build_chat_prompt(
-    user_text: str,
-    memory: List[Tuple[str, str]],
-    turns: int = 6,
-    *,
-    max_chars: int = CHAT_PROMPT_SOFT_CHAR_BUDGET,
-    max_tokens: int = CHAT_PROMPT_SOFT_TOKEN_BUDGET,
-    force_compaction: bool = False,
-) -> str:
-    clean_user_text = sanitize_text(user_text)
-    recent = memory[-max(0, turns * 2) :]
-    full_prompt = build_full_chat_prompt(clean_user_text, recent)
-    if not force_compaction and len(full_prompt) <= max_chars and approximate_token_count(full_prompt) <= max_tokens:
-        return full_prompt
-    return build_compacted_chat_prompt(
-        clean_user_text,
-        memory,
-        turns=turns,
-        max_chars=max_chars,
-        max_tokens=max_tokens,
-        aggressive=force_compaction,
-    )
-
-
-def is_chat_prompt_overflow_error(exc: Exception) -> bool:
-    message = sanitize_text(exc, max_chars=800).lower()
-    return all(marker in message for marker in ("token", "allowed")) or any(
-        marker in message for marker in CHAT_PROMPT_OVERFLOW_MARKERS
-    )
-
-
-def context_pressure_from_fill_ratio(fill_ratio: float) -> str:
-    if fill_ratio >= 0.84:
-        return "red"
-    if fill_ratio >= 0.58:
-        return "amber"
-    return "green"
-
-
-def analyze_chat_context_window(
-    user_text: str,
-    memory: List[Tuple[str, str]],
-    *,
-    turns: int,
-) -> Dict[str, str]:
-    clean_user_text = sanitize_text(user_text)
-    recent = memory[-max(0, turns * 2) :]
-    full_prompt = build_full_chat_prompt(clean_user_text, recent)
-    full_tokens = approximate_token_count(full_prompt)
-    if len(full_prompt) <= CHAT_PROMPT_SOFT_CHAR_BUDGET and full_tokens <= CHAT_PROMPT_SOFT_TOKEN_BUDGET:
-        fill_ratio = 0.0 if CHAT_PROMPT_SOFT_TOKEN_BUDGET <= 0 else min(1.0, full_tokens / CHAT_PROMPT_SOFT_TOKEN_BUDGET)
-        return {
-            "mode": "verbatim_window",
-            "pressure": context_pressure_from_fill_ratio(fill_ratio),
-            "approx_tokens": str(full_tokens),
-            "budget_tokens": str(CHAT_PROMPT_SOFT_TOKEN_BUDGET),
-            "source_messages": str(len(recent)),
-        }
-
-    compact_prompt = build_compacted_chat_prompt(
-        clean_user_text,
-        memory,
-        turns=turns,
-        max_chars=CHAT_PROMPT_SOFT_CHAR_BUDGET,
-        max_tokens=CHAT_PROMPT_SOFT_TOKEN_BUDGET,
-    )
-    compact_tokens = approximate_token_count(compact_prompt)
-    if len(compact_prompt) <= CHAT_PROMPT_SOFT_CHAR_BUDGET and compact_tokens <= CHAT_PROMPT_SOFT_TOKEN_BUDGET:
-        fill_ratio = 0.0 if CHAT_PROMPT_SOFT_TOKEN_BUDGET <= 0 else min(1.0, compact_tokens / CHAT_PROMPT_SOFT_TOKEN_BUDGET)
-        return {
-            "mode": "continuous_compacting_machine",
-            "pressure": context_pressure_from_fill_ratio(fill_ratio),
-            "approx_tokens": str(compact_tokens),
-            "budget_tokens": str(CHAT_PROMPT_SOFT_TOKEN_BUDGET),
-            "source_messages": str(len(memory)),
-        }
-
-    hard_prompt = build_compacted_chat_prompt(
-        clean_user_text,
-        memory,
-        turns=turns,
-        max_chars=CHAT_PROMPT_HARD_CHAR_BUDGET,
-        max_tokens=CHAT_PROMPT_HARD_TOKEN_BUDGET,
-        aggressive=True,
-    )
-    hard_tokens = approximate_token_count(hard_prompt)
-    fill_ratio = 0.0 if CHAT_PROMPT_HARD_TOKEN_BUDGET <= 0 else min(1.0, hard_tokens / CHAT_PROMPT_HARD_TOKEN_BUDGET)
-    return {
-        "mode": "continuous_compacting_machine_hard",
-        "pressure": context_pressure_from_fill_ratio(fill_ratio),
-        "approx_tokens": str(hard_tokens),
-        "budget_tokens": str(CHAT_PROMPT_HARD_TOKEN_BUDGET),
-        "source_messages": str(len(memory)),
-    }
 
 
 def build_chat_system_prompt(
@@ -3021,18 +2526,7 @@ def run_chat_request(
             native_allowed=native_image_allowed,
         )
 
-    compiled_prompt = build_chat_prompt(
-        model_prompt,
-        memory,
-        turns=memory_turns,
-        max_chars=CHAT_PROMPT_SOFT_CHAR_BUDGET,
-        max_tokens=CHAT_PROMPT_SOFT_TOKEN_BUDGET,
-    )
-    prompt_compaction_mode = (
-        "continuous_compacting_machine"
-        if "<context_monitoring_window_surface_agent>" in compiled_prompt
-        else "verbatim_window"
-    )
+    compiled_prompt = build_chat_prompt(model_prompt, memory, turns=memory_turns)
     dynamic_support_rag_context = None
     dynamic_support_rag_surface_name = ""
     recent_dynamic_rag_surfaces: List[str] = []
@@ -3066,50 +2560,18 @@ def run_chat_request(
         dynamic_support_rag_context=dynamic_support_rag_context,
     )
     with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
-        try:
-            reply = litert_chat_blocking(
-                model_path,
-                compiled_prompt,
-                system_text=system_prompt,
-                image_path=model_image_path,
-                cache_dir=cache_dir,
-                enable_vision=bool(model_image_path),
-                inference_backend=inference_backend,
-            )
-        except Exception as exc:
-            if not is_chat_prompt_overflow_error(exc):
-                raise
-            compiled_prompt = build_chat_prompt(
-                model_prompt,
-                memory,
-                turns=memory_turns,
-                max_chars=CHAT_PROMPT_HARD_CHAR_BUDGET,
-                max_tokens=CHAT_PROMPT_HARD_TOKEN_BUDGET,
-                force_compaction=True,
-            )
-            prompt_compaction_mode = "continuous_compacting_machine_hard"
-            try:
-                reply = litert_chat_blocking(
-                    model_path,
-                    compiled_prompt,
-                    system_text=system_prompt,
-                    image_path=model_image_path,
-                    cache_dir=cache_dir,
-                    enable_vision=bool(model_image_path),
-                    inference_backend=inference_backend,
-                )
-            except Exception as retry_exc:
-                if is_chat_prompt_overflow_error(retry_exc):
-                    raise RuntimeError(
-                        "The local runtime hit its token limit even after continuous prompt compaction. "
-                        "Try fewer memory turns, clear the chat, or shorten the latest message."
-                    ) from retry_exc
-                raise
+        reply = litert_chat_blocking(
+            model_path,
+            compiled_prompt,
+            system_text=system_prompt,
+            image_path=model_image_path,
+            cache_dir=cache_dir,
+            enable_vision=bool(model_image_path),
+            inference_backend=inference_backend,
+        )
     log_prompt = clean_prompt
     if safe_image_path is not None:
         log_prompt = f"{model_prompt}\n[Image attached: {safe_image_path.name}]"
-    if prompt_compaction_mode != "verbatim_window":
-        log_prompt += f"\n[Context surface: {prompt_compaction_mode}]"
     log_interaction(log_prompt, sanitize_text(reply), key, session_id=session_id)
     if enable_dynamic_support_rag and dynamic_support_rag_surface_name:
         try:
@@ -3809,8 +3271,6 @@ class HumoidStudioApp(AppBase):
         self.settings_chat_font_size_var = tk.IntVar(value=max(9, min(28, chat_font_size_setting)))
         self.chat_font_size_label_var = tk.StringVar()
         self.chat_input_stats_var = tk.StringVar(value="0 chars | 0 lines | Shift+Enter for newline")
-        self.chat_context_status_var = tk.StringVar(value="Context idle | 0/2800 tok | verbatim")
-        self.chat_context_after_id: Optional[str] = None
         self.settings_native_image_var = tk.BooleanVar(value=bool(self.settings_data.get("enable_native_image_input", False)))
         self.settings_inference_backend_var = tk.StringVar(
             value=normalize_setting_choice(
@@ -4097,7 +3557,6 @@ class HumoidStudioApp(AppBase):
                 else ""
             )
             self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}.{recovery_note}")
-        self.schedule_chat_context_status_update()
         self.refresh_dashboard()
         self.after(700, self.request_qid_mood_generation)
         self.after(900, self.offer_first_model_download)
@@ -4448,61 +3907,6 @@ class HumoidStudioApp(AppBase):
         if hasattr(self, "chat_output"):
             self.configure_textbox_tags(self.chat_output, base_size=size)
 
-    def schedule_chat_context_status_update(self) -> None:
-        if getattr(self, "chat_context_after_id", None) is not None:
-            try:
-                self.after_cancel(self.chat_context_after_id)
-            except Exception:
-                pass
-            self.chat_context_after_id = None
-        self.chat_context_after_id = self.after(120, self.update_chat_context_status)
-
-    def update_chat_context_status(self) -> None:
-        self.chat_context_after_id = None
-        if not hasattr(self, "chat_context_chip"):
-            return
-        if not hasattr(self, "chat_input"):
-            self.chat_context_status_var.set("Context idle | 0/2800 tok | verbatim")
-            return
-        try:
-            draft_text = sanitize_text(self.chat_input.get("1.0", "end-1c"))
-        except Exception:
-            draft_text = ""
-        if not draft_text.strip() and not self.chat_memory:
-            self.chat_context_status_var.set("Context idle | 0/2800 tok | verbatim")
-            self.chat_context_chip.configure(fg_color=PALETTE["accent_teal"], text_color="#031009")
-            return
-        try:
-            turns = int(self.settings_memory_turns_var.get())
-        except Exception:
-            turns = 6
-        snapshot = analyze_chat_context_window(draft_text, list(self.chat_memory), turns=turns)
-        mode_label = {
-            "verbatim_window": "verbatim",
-            "continuous_compacting_machine": "compact",
-            "continuous_compacting_machine_hard": "hard-compact",
-        }.get(snapshot.get("mode", ""), "compact")
-        pressure = snapshot.get("pressure", "green")
-        approx_tokens = snapshot.get("approx_tokens", "0")
-        budget_tokens = snapshot.get("budget_tokens", str(CHAT_PROMPT_SOFT_TOKEN_BUDGET))
-        source_messages = snapshot.get("source_messages", "0")
-        self.chat_context_status_var.set(
-            f"Context {pressure} | {approx_tokens}/{budget_tokens} tok | {mode_label} | {source_messages} msgs"
-        )
-        if pressure == "red":
-            fg_color = PALETTE["danger"]
-            text_color = "#fff5f7"
-        elif pressure == "amber":
-            fg_color = PALETTE["accent_gold"]
-            text_color = "#031009"
-        else:
-            fg_color = PALETTE["accent_teal"]
-            text_color = "#031009"
-        try:
-            self.chat_context_chip.configure(fg_color=fg_color, text_color=text_color)
-        except Exception:
-            pass
-
     def update_chat_input_stats(self, _event: Optional[Any] = None) -> None:
         if not hasattr(self, "chat_input"):
             return
@@ -4515,14 +3919,12 @@ class HumoidStudioApp(AppBase):
         self.chat_input_stats_var.set(
             f"{len(text)} chars | {word_count} words | {line_count} lines | Shift+Enter for newline"
         )
-        self.schedule_chat_context_status_update()
 
     def clear_chat_input(self) -> None:
         if not hasattr(self, "chat_input"):
             return
         self.chat_input.delete("1.0", "end")
         self.update_chat_input_stats()
-        self.schedule_chat_context_status_update()
         self.status_var.set("Prompt box cleared.")
 
     def run_task(
@@ -5242,29 +4644,12 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         send_button.grid(row=0, column=1, sticky="ns", padx=(14, 0))
         self.register_action(send_button)
 
-        compose_status = ctk.CTkFrame(compose, fg_color="transparent")
-        compose_status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        compose_status.grid_columnconfigure(0, weight=1)
-        compose_status.grid_columnconfigure(1, weight=0)
-
         ctk.CTkLabel(
-            compose_status,
+            compose,
             textvariable=self.chat_input_stats_var,
             font=self.small_font,
             text_color=PALETTE["muted"],
-        ).grid(row=0, column=0, sticky="w")
-
-        self.chat_context_chip = ctk.CTkLabel(
-            compose_status,
-            textvariable=self.chat_context_status_var,
-            font=self.small_font,
-            text_color="#031009",
-            fg_color=PALETTE["accent_teal"],
-            corner_radius=14,
-            padx=12,
-            pady=5,
-        )
-        self.chat_context_chip.grid(row=0, column=1, sticky="e")
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         self.chat_toolbar_visible = False
         compact_toolbar = ctk.CTkFrame(left, fg_color="transparent")
@@ -5455,7 +4840,6 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.memory_preview.insert("1.0", "No turns yet.\n")
         self.memory_preview.configure(state="disabled")
         self.configure_textbox_tags(self.memory_preview)
-        self.schedule_chat_context_status_update()
 
         hide_memory_button = self.make_button(right, "Hide Memory", self.hide_memory_panel, 5, width=140, height=38)
         hide_memory_button.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 20))
@@ -6656,7 +6040,6 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 self.insert_markdown_text(self.memory_preview, message, max_chars=5000)
                 self.memory_preview.insert("end", "\n")
         self.memory_preview.configure(state="disabled")
-        self.schedule_chat_context_status_update()
 
     def refresh_dashboard(self) -> None:
         summary = storage_summary(self.key)
@@ -6717,7 +6100,6 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             ("meta",),
         )
         self.chat_output.configure(state="disabled")
-        self.schedule_chat_context_status_update()
         self.status_var.set("New chat session ready. The next message will create a fresh encrypted session.")
 
     def clear_chat(self) -> None:
@@ -6733,7 +6115,6 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.chat_output.configure(state="disabled")
         self.tts_last_text = ""
         self.refresh_memory_preview()
-        self.schedule_chat_context_status_update()
 
     def toggle_image_mode(self) -> None:
         if self.image_mode_var.get():
@@ -7379,12 +6760,6 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.status_var.set("Studio locked.")
         self.hash_status_var.set("Hash: Not checked")
         self.chat_memory.clear()
-        self.chat_context_status_var.set("Context idle | 0/2800 tok | verbatim")
-        try:
-            if hasattr(self, "chat_context_chip"):
-                self.chat_context_chip.configure(fg_color=PALETTE["accent_teal"], text_color="#031009")
-        except Exception:
-            pass
         self.hide_chat_toolbar(persist=False)
         self.vault_rotation_status_var.set("Unlock the vault to generate an entropic rotation schedule.")
         self.vault_hardening_status_var.set("Unlock the vault to inspect active hardening features.")

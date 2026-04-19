@@ -121,6 +121,10 @@ DASHBOARD_QUANTUM_COLOR_TRAIL_KEY = "dashboard_quantum_color_trail"
 VAULT_ROTATION_MACHINE_STATE_KEY = "vault_rotation_machine_state"
 VAULT_ROTATION_AUDIT_LOG_KEY = "vault_rotation_audit_log"
 VAULT_HARDENING_STATE_KEY = "vault_hardening_state"
+CONTINUATION_WORKSPACE_STATE_KEY = "continuation_workspace_state"
+CONTINUATION_CAPSULE_HISTORY_KEY = "continuation_capsule_history"
+CONTINUATION_RESUME_PACKET_KEY = "continuation_resume_packet"
+APP_STATE_VALUE_MAX_CHARS = 12000
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 LATEX_COMMAND_REPLACEMENTS = {
@@ -281,6 +285,26 @@ CHAT_DEPTH_OPTIONS = ["Brief", "Normal", "Deep"]
 INFERENCE_BACKEND_OPTIONS = ["Auto", "CPU", "GPU"]
 INFERENCE_AUTO_SELECTED_OPTIONS = ["", "CPU", "GPU"]
 DYNAMIC_SUPPORT_RAG_MODE_OPTIONS = ["Gentle", "Builder", "Inventive"]
+CONTINUATION_LOOP_COUNTS = [2, 3, 5, 20]
+CONTINUATION_LOOP_OPTIONS = [str(value) for value in CONTINUATION_LOOP_COUNTS]
+CONTINUATION_ROLE_SEQUENCE = [
+    "Architect",
+    "Implementer",
+    "Speculative Builder",
+    "Critic",
+    "Verifier",
+    "Optimizer",
+    "Handoff Writer",
+]
+CONTINUATION_MILESTONE_SEQUENCE = ["understand", "design", "patch", "review", "handoff"]
+CONTINUATION_STEERING_PRESETS = {
+    "Direction": "Bias the next loops toward the highest-value interpretation of the user's goal and remove drift.",
+    "Scope": "Tighten scope, cut non-essential branches, and finish the smallest high-value surface cleanly.",
+    "Bugs": "Focus on bugs, regressions, edge cases, and hidden failure modes before adding new polish.",
+    "Production": "Favor production readiness: reliability, maintainability, explicit errors, and testability.",
+    "Code Plan": "Pause heavy implementation and return a sharp code plan, file map, and patch order.",
+}
+CONTINUATION_STEERING_PRESET_LABELS = list(CONTINUATION_STEERING_PRESETS.keys())
 CHAT_STYLE_GUIDES = {
     "Balanced": "Be warm, useful, and direct. Match the user's energy without overexplaining.",
     "Code": "Prioritize correct runnable code, compact explanations, edge cases, and safe local assumptions.",
@@ -352,6 +376,9 @@ DEFAULT_SETTINGS = {
     "chat_style": "Balanced",
     "response_depth": "Normal",
     "strict_prompt_formatting": True,
+    "continuation_mode_enabled": False,
+    "continuation_loop_count": 3,
+    "continuation_auto_budget": True,
 }
 
 GUI_READY = tk is not None and ctk is not None
@@ -382,6 +409,14 @@ def sanitize_text(value: Any, *, max_chars: int = 20000) -> str:
 def normalize_setting_choice(value: Any, options: List[str], default: str) -> str:
     clean_value = sanitize_text(value, max_chars=80).strip()
     return clean_value if clean_value in options else default
+
+
+def normalize_continuation_loop_count(value: Any, default: int = 3) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except Exception:
+        parsed = default
+    return parsed if parsed in CONTINUATION_LOOP_COUNTS else default
 
 
 def clamp_float(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -450,6 +485,148 @@ def compact_text_excerpt(value: Any, *, max_chars: int = 240) -> str:
     if len(text) > max_chars:
         return text[: max_chars - 3].rstrip() + "..."
     return text
+
+
+def stitch_text_window(value: Any, *, max_chars: int = 3200, edge_chars: int = 1400) -> str:
+    text = sanitize_text(value, max_chars=max_chars * 4).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) <= max_chars:
+        return text
+    edge = max(200, min(edge_chars, max_chars // 2))
+    head = text[:edge].rstrip()
+    tail = text[-edge:].lstrip()
+    omitted = max(0, len(text) - len(head) - len(tail))
+    return f"{head}\n\n[... stitched forward, {omitted} chars omitted ...]\n\n{tail}"
+
+
+def extract_tagged_section(text: Any, tag: str, *, max_chars: int = 4000) -> str:
+    clean_text = sanitize_text(text, max_chars=max_chars * 6)
+    pattern = re.compile(rf"<{re.escape(tag)}>\s*(.*?)\s*</{re.escape(tag)}>", re.IGNORECASE | re.DOTALL)
+    match = pattern.search(clean_text)
+    if not match:
+        return ""
+    return sanitize_text(match.group(1), max_chars=max_chars).strip()
+
+
+def extract_tagged_float(text: Any, tag: str, *, default: float = 0.0) -> float:
+    raw = extract_tagged_section(text, tag, max_chars=64)
+    try:
+        return float(raw.strip())
+    except Exception:
+        return float(default)
+
+
+def continuation_role_for_loop(loop_index: int) -> str:
+    if loop_index <= 0:
+        return CONTINUATION_ROLE_SEQUENCE[0]
+    return CONTINUATION_ROLE_SEQUENCE[(loop_index - 1) % len(CONTINUATION_ROLE_SEQUENCE)]
+
+
+def continuation_milestone_for_loop(loop_index: int, loop_count: int) -> str:
+    if loop_count <= 1:
+        return CONTINUATION_MILESTONE_SEQUENCE[-1]
+    scaled = (max(1, loop_index) - 1) / max(1, loop_count - 1)
+    milestone_index = min(
+        len(CONTINUATION_MILESTONE_SEQUENCE) - 1,
+        int(round(scaled * (len(CONTINUATION_MILESTONE_SEQUENCE) - 1))),
+    )
+    return CONTINUATION_MILESTONE_SEQUENCE[milestone_index]
+
+
+def continuation_requires_test_pulse(loop_index: int, loop_count: int, role: str, milestone: str) -> bool:
+    if milestone in {"review", "handoff"}:
+        return True
+    if "Verifier" in role:
+        return True
+    return loop_index % 2 == 0 or loop_index == loop_count
+
+
+def parse_continuation_loop_reply(text: Any) -> Dict[str, str]:
+    raw = sanitize_text(text, max_chars=18000).strip()
+    artifact = extract_tagged_section(raw, "artifact", max_chars=10000)
+    progress = extract_tagged_section(raw, "progress", max_chars=1200)
+    next_focus = extract_tagged_section(raw, "next_focus", max_chars=1200)
+    handoff = extract_tagged_section(raw, "handoff", max_chars=2400)
+    checkpoint_capsule = extract_tagged_section(raw, "checkpoint_capsule", max_chars=1600)
+    code_surface_atlas = extract_tagged_section(raw, "code_surface_atlas", max_chars=1500)
+    evidence_ledger = extract_tagged_section(raw, "evidence_ledger", max_chars=1500)
+    test_pulse = extract_tagged_section(raw, "test_pulse", max_chars=1200)
+    memory_grades = extract_tagged_section(raw, "memory_grades", max_chars=1200)
+    branch_safe = extract_tagged_section(raw, "branch_safe", max_chars=1000)
+    branch_fast = extract_tagged_section(raw, "branch_fast", max_chars=1000)
+    branch_risky = extract_tagged_section(raw, "branch_risky", max_chars=1000)
+    branch_merge = extract_tagged_section(raw, "branch_merge", max_chars=1000)
+    milestone_status = extract_tagged_section(raw, "milestone_status", max_chars=1200)
+    continue_recommendation = extract_tagged_section(raw, "continue_recommendation", max_chars=64)
+    momentum_score = extract_tagged_float(raw, "momentum_score", default=0.5)
+    if not artifact:
+        artifact = stitch_text_window(raw, max_chars=9000, edge_chars=3200)
+    if not progress:
+        progress = compact_text_excerpt(raw, max_chars=320)
+    if not next_focus:
+        next_focus = "Tighten the strongest surface, preserve the best code or structure, and reduce ambiguity."
+    if not handoff:
+        handoff = compact_text_excerpt(artifact, max_chars=520)
+    if not checkpoint_capsule:
+        checkpoint_capsule = "\n".join(
+            [
+                f"Progress: {compact_text_excerpt(progress, max_chars=240)}",
+                f"Next focus: {compact_text_excerpt(next_focus, max_chars=200)}",
+                f"Handoff: {compact_text_excerpt(handoff, max_chars=260)}",
+            ]
+        )
+    if not code_surface_atlas:
+        code_surface_atlas = "Files/functions/tests not mapped yet; use the current artifact and next focus as the working atlas."
+    if not evidence_ledger:
+        evidence_ledger = "Facts: derived from the visible prompt/context. Unknowns: verify against the codebase or runtime. Assumptions: keep them explicit."
+    if not test_pulse:
+        test_pulse = "No explicit test pulse returned this loop. Validate the strongest changed path, likely regressions, and the newest branch merge."
+    if not memory_grades:
+        memory_grades = "hard_constraint: latest user request | likely_relevant: recent chat and merged branch | speculative: unstated architecture guesses | discardable: stale explorations"
+    if not branch_merge:
+        branch_merge = compact_text_excerpt(artifact, max_chars=260)
+    if not milestone_status:
+        milestone_status = "understand=active | design=warming | patch=pending | review=pending | handoff=pending"
+    if not continue_recommendation:
+        continue_recommendation = "yes"
+    return {
+        "raw": raw,
+        "artifact": artifact.strip(),
+        "progress": progress.strip(),
+        "next_focus": next_focus.strip(),
+        "handoff": handoff.strip(),
+        "checkpoint_capsule": checkpoint_capsule.strip(),
+        "code_surface_atlas": code_surface_atlas.strip(),
+        "evidence_ledger": evidence_ledger.strip(),
+        "test_pulse": test_pulse.strip(),
+        "memory_grades": memory_grades.strip(),
+        "branch_safe": branch_safe.strip(),
+        "branch_fast": branch_fast.strip(),
+        "branch_risky": branch_risky.strip(),
+        "branch_merge": branch_merge.strip(),
+        "milestone_status": milestone_status.strip(),
+        "continue_recommendation": continue_recommendation.strip().lower(),
+        "momentum_score": f"{max(0.0, min(1.0, momentum_score)):.2f}",
+    }
+
+
+def summarize_continuation_highlights(loop_packets: List[Dict[str, str]], limit: int = 4) -> List[str]:
+    highlights: List[str] = []
+    for packet in loop_packets:
+        item = compact_text_excerpt(packet.get("progress", ""), max_chars=220)
+        if item and item not in highlights:
+            highlights.append(item)
+    return highlights[-max(1, limit) :]
+
+
+def summarize_continuation_field(loop_packets: List[Dict[str, str]], field_name: str, *, max_chars: int = 380) -> str:
+    values: List[str] = []
+    for packet in reversed(loop_packets):
+        value = compact_text_excerpt(packet.get(field_name, ""), max_chars=max_chars)
+        if value and value not in values:
+            values.append(value)
+        if values:
+            break
+    return values[0] if values else ""
 
 
 def chunk_text_for_context(
@@ -1692,14 +1869,14 @@ def fetch_app_state_value(key: bytes, name: str, default: str = "") -> str:
             row = db.execute("SELECT value FROM app_state WHERE name = ?", (clean_name,)).fetchone()
     if row is None or row[0] is None:
         return default
-    return sanitize_text(row[0], max_chars=4000)
+    return sanitize_text(row[0], max_chars=APP_STATE_VALUE_MAX_CHARS)
 
 
 def save_app_state_value(key: bytes, name: str, value: str) -> None:
     clean_name = sanitize_text(name, max_chars=120).strip()
     if not clean_name:
         raise ValueError("Encrypted app state keys cannot be blank.")
-    clean_value = sanitize_text(value, max_chars=4000)
+    clean_value = sanitize_text(value, max_chars=APP_STATE_VALUE_MAX_CHARS)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with unlocked_db_path(key) as temp_db:
         with connect_sqlite(temp_db) as db:
@@ -1745,6 +1922,141 @@ def save_dynamic_support_rag_history(key: bytes, history: List[str]) -> None:
         if clean_value and clean_value not in clean_history:
             clean_history.append(clean_value)
     save_app_state_value(key, DYNAMIC_SUPPORT_RAG_HISTORY_KEY, json.dumps(clean_history[:8]))
+
+
+def normalize_continuation_workspace_state(state: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not isinstance(state, dict):
+        return {}
+
+    def clean(name: str, max_chars: int) -> str:
+        return sanitize_text(state.get(name, ""), max_chars=max_chars).strip()
+
+    return {
+        "session_id": clean("session_id", 24),
+        "updated_at": clean("updated_at", 40) or time.strftime("%Y-%m-%d %H:%M:%S"),
+        "requested_loops": clean("requested_loops", 12),
+        "completed_loops": clean("completed_loops", 12),
+        "role": clean("role", 40),
+        "milestone": clean("milestone", 40),
+        "milestone_status": clean("milestone_status", 500),
+        "progress": clean("progress", 320),
+        "artifact_excerpt": clean("artifact_excerpt", 800),
+        "next_focus": clean("next_focus", 320),
+        "handoff": clean("handoff", 900),
+        "capsule": clean("capsule", 1000),
+        "atlas": clean("atlas", 700),
+        "evidence": clean("evidence", 700),
+        "test_pulse": clean("test_pulse", 600),
+        "memory_grades": clean("memory_grades", 600),
+        "branch_safe": clean("branch_safe", 320),
+        "branch_fast": clean("branch_fast", 320),
+        "branch_risky": clean("branch_risky", 320),
+        "branch_merge": clean("branch_merge", 420),
+        "steering": clean("steering", 360),
+        "momentum": clean("momentum", 48),
+        "continue_recommendation": clean("continue_recommendation", 24),
+        "resume_ready": "1" if fetch_truthy_text(clean("resume_ready", 8)) else "0",
+    }
+
+
+def fetch_truthy_text(value: str) -> bool:
+    return sanitize_text(value, max_chars=24).strip().lower() in {"1", "true", "yes", "on", "continue", "keep_going"}
+
+
+def load_continuation_workspace_state(key: bytes) -> Dict[str, str]:
+    raw_value = fetch_app_state_value(key, CONTINUATION_WORKSPACE_STATE_KEY, default="{}")
+    try:
+        state = json.loads(raw_value)
+    except Exception:
+        return {}
+    clean_state = normalize_continuation_workspace_state(state)
+    if not any(clean_state.values()):
+        return {}
+    return clean_state
+
+
+def save_continuation_workspace_state(key: bytes, state: Dict[str, Any]) -> Dict[str, str]:
+    clean_state = normalize_continuation_workspace_state(state)
+    save_app_state_value(key, CONTINUATION_WORKSPACE_STATE_KEY, json.dumps(clean_state, sort_keys=True))
+    return clean_state
+
+
+def load_continuation_capsule_history(key: bytes) -> List[Dict[str, str]]:
+    raw_value = fetch_app_state_value(key, CONTINUATION_CAPSULE_HISTORY_KEY, default="[]")
+    try:
+        values = json.loads(raw_value)
+    except Exception:
+        return []
+    if not isinstance(values, list):
+        return []
+    history: List[Dict[str, str]] = []
+    for value in values:
+        clean_state = normalize_continuation_workspace_state(value)
+        if clean_state.get("capsule") or clean_state.get("progress") or clean_state.get("handoff"):
+            history.append(clean_state)
+    return history[:6]
+
+
+def save_continuation_capsule_history(key: bytes, history: List[Dict[str, Any]]) -> None:
+    clean_history: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for value in history:
+        clean_state = normalize_continuation_workspace_state(value)
+        signature = "|".join(
+            [
+                clean_state.get("updated_at", ""),
+                clean_state.get("capsule", "")[:160],
+                clean_state.get("progress", ""),
+                clean_state.get("milestone", ""),
+            ]
+        )
+        if not signature.strip("|") or signature in seen:
+            continue
+        seen.add(signature)
+        clean_history.append(clean_state)
+    save_app_state_value(key, CONTINUATION_CAPSULE_HISTORY_KEY, json.dumps(clean_history[:6], sort_keys=True))
+
+
+def append_continuation_capsule_history(key: bytes, state: Dict[str, Any]) -> None:
+    clean_state = normalize_continuation_workspace_state(state)
+    existing = load_continuation_capsule_history(key)
+    save_continuation_capsule_history(key, [clean_state, *existing])
+
+
+def build_continuation_resume_packet(state: Dict[str, str]) -> str:
+    lines = [
+        "<resume_packet>",
+        "Resume from the last saved continuation checkpoint before using fresh chat history.",
+    ]
+    for label, key_name in (
+        ("Session", "session_id"),
+        ("Milestone", "milestone"),
+        ("Role", "role"),
+        ("Progress", "progress"),
+        ("Checkpoint capsule", "capsule"),
+        ("Atlas", "atlas"),
+        ("Evidence ledger", "evidence"),
+        ("Test pulse", "test_pulse"),
+        ("Memory grades", "memory_grades"),
+        ("Merged branch", "branch_merge"),
+        ("Handoff", "handoff"),
+        ("Next focus", "next_focus"),
+        ("Steering", "steering"),
+    ):
+        value = sanitize_text(state.get(key_name, ""), max_chars=900).strip()
+        if value:
+            lines.append(f"{label}: {value}")
+    lines.append("</resume_packet>")
+    return "\n".join(lines)
+
+
+def save_continuation_resume_packet(key: bytes, state: Dict[str, Any]) -> None:
+    clean_state = normalize_continuation_workspace_state(state)
+    save_app_state_value(key, CONTINUATION_RESUME_PACKET_KEY, build_continuation_resume_packet(clean_state))
+
+
+def load_continuation_resume_packet(key: bytes) -> str:
+    return fetch_app_state_value(key, CONTINUATION_RESUME_PACKET_KEY, default="")
 
 
 def normalize_dashboard_quantum_color_state(state: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -2453,6 +2765,18 @@ def litert_chat_blocking(
             return response_to_text(conversation.send_message(create_user_message(user_text, image_path)))
 
 
+def litert_chat_with_engine(
+    engine: Any,
+    user_text: str,
+    *,
+    system_text: Optional[str] = None,
+    image_path: Optional[str] = None,
+) -> str:
+    messages = create_default_messages(system_text)
+    with engine.create_conversation(messages=messages) as conversation:
+        return response_to_text(conversation.send_message(create_user_message(user_text, image_path)))
+
+
 def collect_system_metrics() -> Dict[str, float]:
     if psutil is None:
         raise RuntimeError("psutil is required for system metrics.")
@@ -2860,6 +3184,12 @@ def load_settings() -> Dict[str, Any]:
     settings["dynamic_support_rag_mode"] = normalize_setting_choice(
         settings.get("dynamic_support_rag_mode"), DYNAMIC_SUPPORT_RAG_MODE_OPTIONS, "Builder"
     )
+    settings["continuation_mode_enabled"] = bool(settings.get("continuation_mode_enabled", False))
+    settings["continuation_loop_count"] = normalize_continuation_loop_count(
+        settings.get("continuation_loop_count"),
+        default=normalize_continuation_loop_count(DEFAULT_SETTINGS.get("continuation_loop_count", 3)),
+    )
+    settings["continuation_auto_budget"] = bool(settings.get("continuation_auto_budget", True))
     settings["inference_backend"] = normalize_setting_choice(
         settings.get("inference_backend"), INFERENCE_BACKEND_OPTIONS, "Auto"
     )
@@ -2996,6 +3326,273 @@ def build_chat_system_prompt(
         )
     return "\n".join(lines)
 
+
+def build_continuation_system_prompt(
+    chat_style: str = "Balanced",
+    response_depth: str = "Normal",
+    strict_prompt_formatting: bool = True,
+    enable_dynamic_support_rag: bool = False,
+    dynamic_support_rag_mode: str = "Builder",
+    dynamic_support_rag_context: Optional[str] = None,
+) -> str:
+    base_prompt = build_chat_system_prompt(
+        chat_style=chat_style,
+        response_depth=response_depth,
+        strict_prompt_formatting=strict_prompt_formatting,
+        enable_dynamic_support_rag=enable_dynamic_support_rag,
+        dynamic_support_rag_mode=dynamic_support_rag_mode,
+        dynamic_support_rag_context=dynamic_support_rag_context,
+    )
+    continuation_lines = [
+        "",
+        "Continuation agent mode is active.",
+        "You are working on a long-horizon task across stitched context windows.",
+        "Each loop should preserve the strongest current draft, code surface, or reasoning surface and improve it incrementally.",
+        "Prefer compact carry-forward state over re-explaining everything from scratch.",
+        "Use branch-and-merge thinking: keep a safe path, a fast path, and a risky/speculative path, then merge the best parts.",
+        "Role-cycle across loops, honor the active milestone, and preserve a compact code surface atlas.",
+        "Emit a checkpoint capsule each loop so the work can pause and resume later without depending on raw history.",
+        "Maintain an evidence ledger that separates facts, assumptions, unknowns, and risks.",
+        "Maintain memory grades so hard constraints stay sticky while stale speculation can be discarded.",
+        "When asked for a test pulse, name concrete tests, regressions, and verification gaps before claiming the work is done.",
+        "When the loop prompt says wrap_up_after_this_loop=yes, produce a self-contained artifact plus a human handoff that can pause and resume later.",
+        "Do not mention hidden loop scaffolding, internal tags, or private continuation mechanics in normal prose outside the requested tags.",
+    ]
+    return "\n".join([base_prompt, *continuation_lines])
+
+
+def consume_continuation_control_queue(control_queue: Optional[Any]) -> List[str]:
+    steering_notes: List[str] = []
+    if control_queue is None:
+        return steering_notes
+    while True:
+        try:
+            payload = control_queue.get_nowait()
+        except queue.Empty:
+            break
+        except Exception:
+            break
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("kind") == "steer":
+            note = sanitize_text(payload.get("text", ""), max_chars=700).strip()
+            if note:
+                steering_notes.append(note)
+    return steering_notes
+
+
+def resolve_continuation_budget(loop_count: int, auto_budget: bool) -> Tuple[int, int]:
+    max_loops = normalize_continuation_loop_count(loop_count)
+    min_loops = min(max_loops, 2 if auto_budget else max_loops)
+    return max_loops, max(1, min_loops)
+
+
+def should_stop_continuation_early(
+    packet: Dict[str, str],
+    *,
+    loop_index: int,
+    min_loops: int,
+    auto_budget: bool,
+    milestone: str,
+) -> bool:
+    if not auto_budget or loop_index < min_loops:
+        return False
+    recommendation = sanitize_text(packet.get("continue_recommendation", ""), max_chars=24).strip().lower()
+    try:
+        momentum = float(packet.get("momentum_score", "0.5"))
+    except Exception:
+        momentum = 0.5
+    if recommendation in {"no", "stop", "pause", "wrap"} and momentum <= 0.72:
+        return True
+    return milestone == "handoff" and momentum <= 0.46
+
+
+def build_continuation_workspace_state_from_packet(
+    packet: Dict[str, str],
+    *,
+    session_id: Optional[int],
+    requested_loops: int,
+    completed_loops: int,
+    role: str,
+    milestone: str,
+    steering: str,
+) -> Dict[str, str]:
+    return normalize_continuation_workspace_state(
+        {
+            "session_id": str(session_id or ""),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "requested_loops": str(requested_loops),
+            "completed_loops": str(completed_loops),
+            "role": role,
+            "milestone": milestone,
+            "milestone_status": packet.get("milestone_status", ""),
+            "progress": packet.get("progress", ""),
+            "artifact_excerpt": compact_text_excerpt(packet.get("artifact", ""), max_chars=760),
+            "next_focus": packet.get("next_focus", ""),
+            "handoff": packet.get("handoff", ""),
+            "capsule": packet.get("checkpoint_capsule", ""),
+            "atlas": packet.get("code_surface_atlas", ""),
+            "evidence": packet.get("evidence_ledger", ""),
+            "test_pulse": packet.get("test_pulse", ""),
+            "memory_grades": packet.get("memory_grades", ""),
+            "branch_safe": compact_text_excerpt(packet.get("branch_safe", ""), max_chars=260),
+            "branch_fast": compact_text_excerpt(packet.get("branch_fast", ""), max_chars=260),
+            "branch_risky": compact_text_excerpt(packet.get("branch_risky", ""), max_chars=260),
+            "branch_merge": packet.get("branch_merge", ""),
+            "steering": steering,
+            "momentum": packet.get("momentum_score", ""),
+            "continue_recommendation": packet.get("continue_recommendation", ""),
+            "resume_ready": "1",
+        }
+    )
+
+
+def build_continuation_loop_prompt(
+    task_prompt: str,
+    *,
+    loop_index: int,
+    loop_count: int,
+    working_surface: str,
+    loop_packets: List[Dict[str, str]],
+    wrap_up_after_this_loop: bool,
+    loop_role: str,
+    milestone: str,
+    steering_notes: List[str],
+    resume_packet: str,
+    require_test_pulse: bool,
+    auto_budget: bool,
+) -> str:
+    lines = [
+        "<continuation_agent_job>",
+        "Extend this task across stitched context windows.",
+        f"planned_loops={loop_count}",
+        f"current_loop={loop_index}",
+        f"loop_role={loop_role}",
+        f"milestone={milestone}",
+        f"auto_budget={'on' if auto_budget else 'off'}",
+        f"test_pulse_required={'yes' if require_test_pulse else 'no'}",
+        f"wrap_up_after_this_loop={'yes' if wrap_up_after_this_loop else 'no'}",
+        "Preserve the strongest implementation surface, improve it, and leave a crisp handoff.",
+        "Maintain branch-and-merge, checkpoint capsules, a code surface atlas, an evidence ledger, and memory grades.",
+        "</continuation_agent_job>",
+        "",
+        "<task_request_context>",
+        task_prompt,
+        "</task_request_context>",
+    ]
+
+    if resume_packet and not loop_packets:
+        lines.extend(["", resume_packet])
+
+    if steering_notes:
+        lines.extend(["", "<human_steering>"])
+        for note in steering_notes[-6:]:
+            lines.append(f"- {compact_text_excerpt(note, max_chars=320)}")
+        lines.append("</human_steering>")
+
+    if loop_packets:
+        lines.extend(["", "<recent_loop_progress>"])
+        for index, packet in enumerate(loop_packets[-4:], start=max(1, len(loop_packets) - 3)):
+            lines.append(f"loop_{index}_progress: {compact_text_excerpt(packet.get('progress', ''), max_chars=280)}")
+            lines.append(f"loop_{index}_next_focus: {compact_text_excerpt(packet.get('next_focus', ''), max_chars=220)}")
+            lines.append(f"loop_{index}_branch_merge: {compact_text_excerpt(packet.get('branch_merge', ''), max_chars=220)}")
+            lines.append(f"loop_{index}_atlas: {compact_text_excerpt(packet.get('code_surface_atlas', ''), max_chars=220)}")
+        lines.append("</recent_loop_progress>")
+
+    if working_surface:
+        lines.extend(
+            [
+                "",
+                "<working_surface>",
+                stitch_text_window(working_surface, max_chars=5200, edge_chars=1800),
+                "</working_surface>",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "Return exactly one of each of these XML blocks and nothing else outside them:",
+            "<progress>Short summary of what improved in this loop.</progress>",
+            "<artifact>The best current draft, answer, or code surface to carry forward.</artifact>",
+            "<next_focus>The tightest next target for the next loop or next human steering.</next_focus>",
+            "<handoff>What a human should review, validate, or steer next if the work pauses now.</handoff>",
+            "<checkpoint_capsule>Compact resumable capsule with goal, progress, risks, next actions, and resume notes.</checkpoint_capsule>",
+            "<code_surface_atlas>Relevant files, functions, interfaces, tests, and constraints currently in play.</code_surface_atlas>",
+            "<evidence_ledger>Facts | assumptions | unknowns | risks.</evidence_ledger>",
+            "<test_pulse>Concrete tests, likely regressions, and unverified paths.</test_pulse>",
+            "<memory_grades>hard_constraint | likely_relevant | speculative | discardable.</memory_grades>",
+            "<branch_safe>Conservative implementation direction.</branch_safe>",
+            "<branch_fast>Fastest plausible implementation direction.</branch_fast>",
+            "<branch_risky>Speculative/high-upside direction.</branch_risky>",
+            "<branch_merge>Which branch pieces to merge now and why.</branch_merge>",
+            "<milestone_status>understand | design | patch | review | handoff status line.</milestone_status>",
+            "<momentum_score>0.00 to 1.00 convergence score.</momentum_score>",
+            "<continue_recommendation>yes or no.</continue_recommendation>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_continuation_rollup(
+    loop_packets: List[Dict[str, str]],
+    *,
+    requested_loops: int,
+    wrapped_up: bool,
+) -> str:
+    completed_loops = len(loop_packets)
+    latest_packet = loop_packets[-1] if loop_packets else {}
+    highlights = summarize_continuation_highlights(loop_packets, limit=4)
+    artifact = stitch_text_window(latest_packet.get("artifact", ""), max_chars=12000, edge_chars=4200)
+    handoff = stitch_text_window(latest_packet.get("handoff", ""), max_chars=2800, edge_chars=1100)
+    next_focus = compact_text_excerpt(latest_packet.get("next_focus", ""), max_chars=600)
+    capsule = summarize_continuation_field(loop_packets, "checkpoint_capsule", max_chars=900)
+    atlas = summarize_continuation_field(loop_packets, "code_surface_atlas", max_chars=900)
+    evidence = summarize_continuation_field(loop_packets, "evidence_ledger", max_chars=900)
+    test_pulse = summarize_continuation_field(loop_packets, "test_pulse", max_chars=700)
+    memory_grades = summarize_continuation_field(loop_packets, "memory_grades", max_chars=700)
+    branch_merge = summarize_continuation_field(loop_packets, "branch_merge", max_chars=700)
+    milestone_status = summarize_continuation_field(loop_packets, "milestone_status", max_chars=700)
+
+    status_line = (
+        f"Continuation agent paused after {completed_loops}/{requested_loops} loops."
+        if wrapped_up and completed_loops < requested_loops
+        else f"Continuation agent finished {completed_loops}/{requested_loops} loops."
+    )
+
+    lines = [status_line]
+    if highlights:
+        lines.extend(["", "## Loop Highlights"])
+        lines.extend(f"- {item}" for item in highlights)
+    if milestone_status or branch_merge:
+        lines.extend(["", "## Coordination Surface"])
+        if milestone_status:
+            lines.append(f"Milestones: {milestone_status}")
+        if branch_merge:
+            lines.append(f"Branch merge: {branch_merge}")
+    if capsule:
+        lines.extend(["", "## Checkpoint Capsule", capsule])
+    if artifact:
+        lines.extend(["", "## Current Best Surface", artifact])
+    if atlas or evidence or memory_grades:
+        lines.extend(["", "## Workspace Map"])
+        if atlas:
+            lines.append(f"Atlas: {atlas}")
+        if evidence:
+            lines.append(f"Evidence: {evidence}")
+        if memory_grades:
+            lines.append(f"Memory grades: {memory_grades}")
+    if test_pulse:
+        lines.extend(["", "## Test Pulse", test_pulse])
+    if handoff or next_focus:
+        lines.extend(["", "## Human Handoff"])
+        if handoff:
+            lines.append(handoff)
+        if next_focus:
+            lines.append(f"Next steering: {next_focus}")
+    return "\n".join(lines).strip()
+
+
 def run_chat_request(
     key: bytes,
     prompt: str,
@@ -3010,7 +3607,12 @@ def run_chat_request(
     inference_backend: str = "Auto",
     enable_dynamic_support_rag: bool = False,
     dynamic_support_rag_mode: str = "Builder",
+    reporter: Optional[Callable[[str, Any], None]] = None,
+    stop_event: Optional[Any] = None,
+    control_queue: Optional[Any] = None,
 ) -> str:
+    del stop_event
+    del control_queue
     init_db(key)
     clean_prompt = sanitize_text(prompt)
     safe_image_path = validate_image_path(image_path) if image_path else None
@@ -3073,7 +3675,9 @@ def run_chat_request(
         dynamic_support_rag_mode=dynamic_support_rag_mode,
         dynamic_support_rag_context=dynamic_support_rag_context,
     )
+    _status_report(reporter, "status", "Preparing the local chat request...")
     with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
+        _status_report(reporter, "status", "Running the local model...")
         reply = litert_chat_blocking(
             model_path,
             compiled_prompt,
@@ -3083,6 +3687,7 @@ def run_chat_request(
             enable_vision=bool(model_image_path),
             inference_backend=inference_backend,
         )
+    _status_report(reporter, "status", "Sealing the reply back into encrypted history...")
     log_prompt = clean_prompt
     if safe_image_path is not None:
         log_prompt = f"{model_prompt}\n[Image attached: {safe_image_path.name}]"
@@ -3098,13 +3703,227 @@ def run_chat_request(
     return reply
 
 
+def run_chat_continuation_request(
+    key: bytes,
+    prompt: str,
+    memory: List[Tuple[str, str]],
+    memory_turns: int,
+    image_path: Optional[str] = None,
+    native_image_input: bool = False,
+    session_id: Optional[int] = None,
+    chat_style: str = "Balanced",
+    response_depth: str = "Normal",
+    strict_prompt_formatting: bool = True,
+    inference_backend: str = "Auto",
+    enable_dynamic_support_rag: bool = False,
+    dynamic_support_rag_mode: str = "Builder",
+    loop_count: int = 3,
+    auto_budget: bool = True,
+    steering_note: str = "",
+    resume_packet: str = "",
+    reporter: Optional[Callable[[str, Any], None]] = None,
+    stop_event: Optional[Any] = None,
+    control_queue: Optional[Any] = None,
+) -> Dict[str, Any]:
+    init_db(key)
+    clean_prompt = sanitize_text(prompt)
+    safe_image_path = validate_image_path(image_path) if image_path else None
+    native_image_allowed = safe_image_path is not None and native_image_input and configured_model_supports_native_image_input()
+    planned_loops, min_loops = resolve_continuation_budget(loop_count, bool(auto_budget))
+    model_prompt = clean_prompt
+    model_image_path = str(safe_image_path) if native_image_allowed and safe_image_path else None
+    if safe_image_path is not None and not native_image_allowed:
+        model_prompt = clean_prompt + image_metadata_prompt(
+            safe_image_path,
+            native_requested=native_image_input,
+            native_allowed=native_image_allowed,
+        )
+
+    context_increase_surface = ""
+    try:
+        context_increase_surface = build_context_increase_surface(
+            key,
+            clean_prompt,
+            memory,
+            session_id=session_id,
+        )
+    except Exception:
+        context_increase_surface = ""
+
+    compiled_prompt = build_chat_prompt(
+        model_prompt,
+        memory,
+        turns=memory_turns,
+        retrieved_surface=context_increase_surface,
+    )
+
+    dynamic_support_rag_context = None
+    dynamic_support_rag_surface_name = ""
+    recent_dynamic_rag_surfaces: List[str] = []
+    if enable_dynamic_support_rag:
+        try:
+            recent_dynamic_rag_surfaces = load_dynamic_support_rag_history(key)
+        except Exception:
+            recent_dynamic_rag_surfaces = []
+        try:
+            dashboard_quantum_state = load_dashboard_quantum_color_state(key)
+        except Exception:
+            dashboard_quantum_state = {}
+        try:
+            dashboard_quantum_trail = load_dashboard_quantum_color_trail(key)
+        except Exception:
+            dashboard_quantum_trail = []
+        dynamic_rag_packet = build_dynamic_support_rag_packet(
+            dynamic_support_rag_mode,
+            recent_dynamic_rag_surfaces,
+            dashboard_quantum_state,
+            dashboard_quantum_trail,
+        )
+        dynamic_support_rag_context = dynamic_rag_packet["context"]
+        dynamic_support_rag_surface_name = dynamic_rag_packet["surface"]
+
+    system_prompt = build_continuation_system_prompt(
+        chat_style=chat_style,
+        response_depth=response_depth,
+        strict_prompt_formatting=strict_prompt_formatting,
+        enable_dynamic_support_rag=enable_dynamic_support_rag,
+        dynamic_support_rag_mode=dynamic_support_rag_mode,
+        dynamic_support_rag_context=dynamic_support_rag_context,
+    )
+
+    loop_packets: List[Dict[str, str]] = []
+    working_surface = ""
+    wrapped_up = False
+    steering_notes: List[str] = []
+    initial_steering = sanitize_text(steering_note, max_chars=700).strip()
+    if initial_steering:
+        steering_notes.append(initial_steering)
+    resume_context = sanitize_text(resume_packet, max_chars=2800).strip()
+
+    _status_report(reporter, "status", f"Starting continuation agent with {planned_loops} loops...")
+    _status_report(reporter, "progress", 0.0)
+
+    with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
+        engine = load_litert_engine(
+            model_path,
+            cache_dir=cache_dir,
+            enable_vision=bool(model_image_path),
+            inference_backend=inference_backend,
+        )
+        with engine:
+            for loop_index in range(1, planned_loops + 1):
+                steering_notes.extend(consume_continuation_control_queue(control_queue))
+                steering_notes = [note for note in steering_notes if note][-6:]
+                loop_role = continuation_role_for_loop(loop_index)
+                milestone = continuation_milestone_for_loop(loop_index, planned_loops)
+                require_test_pulse = continuation_requires_test_pulse(loop_index, planned_loops, loop_role, milestone)
+                wrap_after_this_loop = bool(stop_event.is_set()) if stop_event is not None else False
+                if wrap_after_this_loop and loop_packets:
+                    _status_report(reporter, "status", f"Wrap-up requested. Finishing loop {loop_index}/{planned_loops}...")
+                else:
+                    _status_report(
+                        reporter,
+                        "status",
+                        f"Continuation loop {loop_index}/{planned_loops}: {loop_role} working on {milestone}...",
+                    )
+                _status_report(reporter, "progress", max(0.0, (loop_index - 1) / float(planned_loops)))
+
+                loop_prompt = build_continuation_loop_prompt(
+                    compiled_prompt,
+                    loop_index=loop_index,
+                    loop_count=planned_loops,
+                    working_surface=working_surface,
+                    loop_packets=loop_packets,
+                    wrap_up_after_this_loop=wrap_after_this_loop or loop_index == planned_loops,
+                    loop_role=loop_role,
+                    milestone=milestone,
+                    steering_notes=steering_notes,
+                    resume_packet=resume_context,
+                    require_test_pulse=require_test_pulse,
+                    auto_budget=bool(auto_budget),
+                )
+                raw_reply = litert_chat_with_engine(
+                    engine,
+                    loop_prompt,
+                    system_text=system_prompt,
+                    image_path=model_image_path if loop_index == 1 else None,
+                )
+                packet = parse_continuation_loop_reply(raw_reply)
+                packet["role"] = loop_role
+                packet["milestone"] = milestone
+                packet["steering"] = " | ".join(steering_notes[-4:])
+                loop_packets.append(packet)
+                working_surface = packet.get("artifact", "") or working_surface
+                workspace_state = build_continuation_workspace_state_from_packet(
+                    packet,
+                    session_id=session_id,
+                    requested_loops=planned_loops,
+                    completed_loops=len(loop_packets),
+                    role=loop_role,
+                    milestone=milestone,
+                    steering=" | ".join(steering_notes[-4:]),
+                )
+                try:
+                    save_continuation_workspace_state(key, workspace_state)
+                    append_continuation_capsule_history(key, workspace_state)
+                    save_continuation_resume_packet(key, workspace_state)
+                except Exception:
+                    pass
+                _status_report(reporter, "progress", min(1.0, loop_index / float(planned_loops)))
+
+                if stop_event is not None and stop_event.is_set():
+                    wrapped_up = True
+                    break
+                if should_stop_continuation_early(
+                    packet,
+                    loop_index=loop_index,
+                    min_loops=min_loops,
+                    auto_budget=bool(auto_budget),
+                    milestone=milestone,
+                ):
+                    break
+
+    rollup = build_continuation_rollup(loop_packets, requested_loops=planned_loops, wrapped_up=wrapped_up)
+    log_prompt = (
+        f"{clean_prompt}\n[Continuation mode: {planned_loops} loops requested | auto budget {'on' if auto_budget else 'off'}]"
+    )
+    if steering_notes:
+        log_prompt += "\n[Steering]\n" + "\n".join(f"- {note}" for note in steering_notes[-4:])
+    if resume_context:
+        log_prompt += "\n[Resume packet primed]"
+    if safe_image_path is not None:
+        mode_label = "native" if native_image_allowed else "metadata"
+        log_prompt = f"{log_prompt}\n{model_prompt}\n[Image attached: {safe_image_path.name} | {mode_label} mode]"
+    log_interaction(log_prompt, rollup, key, session_id=session_id)
+    if enable_dynamic_support_rag and dynamic_support_rag_surface_name:
+        try:
+            save_dynamic_support_rag_history(
+                key,
+                [dynamic_support_rag_surface_name, *recent_dynamic_rag_surfaces],
+            )
+        except Exception:
+            pass
+    return {
+        "reply": rollup,
+        "requested_loops": planned_loops,
+        "completed_loops": len(loop_packets),
+        "wrapped_up": wrapped_up,
+        "workspace_state": load_continuation_workspace_state(key),
+    }
+
+
 def run_qid_mood_request(
     key: bytes,
     qid: str,
     color: str,
     sessions: List[Dict[str, Any]],
     inference_backend: str = "Auto",
+    reporter: Optional[Callable[[str, Any], None]] = None,
+    stop_event: Optional[Any] = None,
+    control_queue: Optional[Any] = None,
 ) -> str:
+    del stop_event
+    del control_queue
     session_lines = []
     for session in sessions[:6]:
         session_lines.append(
@@ -3122,6 +3941,7 @@ def run_qid_mood_request(
         + ("\n".join(session_lines) if session_lines else "- No recent sessions yet")
         + "\n\nMake it feel matrix/cyber, but keep it readable and under 90 characters."
     )
+    _status_report(reporter, "status", "Generating a local dashboard mood...")
     with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
         raw_mood = litert_chat_blocking(
             model_path,
@@ -3199,9 +4019,15 @@ def run_road_scan(
     data: Dict[str, str],
     include_system_entropy: bool,
     inference_backend: str = "Auto",
+    reporter: Optional[Callable[[str, Any], None]] = None,
+    stop_event: Optional[Any] = None,
+    control_queue: Optional[Any] = None,
 ) -> Dict[str, str]:
+    del stop_event
+    del control_queue
     init_db(key)
     system_text, prompt = build_road_scanner_prompt(data, include_system_entropy=include_system_entropy)
+    _status_report(reporter, "status", "Running the local road scanner...")
     with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
         raw = litert_chat_blocking(
             model_path,
@@ -3415,7 +4241,7 @@ def describe_process_exit(task_name: str, task_args: Tuple[Any, ...], exit_code:
         f"Background LiteRT-LM worker crashed with code {exit_code}{signal_note}. "
         "Temporary runtime model/cache files were cleaned up, and your encrypted vault was not overwritten."
     )
-    if task_name == "chat_request" and len(task_args) >= 5 and task_args[4]:
+    if task_name in ("chat_request", "chat_continuation") and len(task_args) >= 5 and task_args[4]:
         detail += (
             "\n\nThis request included an image. If it keeps happening, turn Image mode off for now; "
             "the current LiteRT-LM runtime/model combination may be crashing on multimodal image input."
@@ -3430,15 +4256,19 @@ def describe_process_exit(task_name: str, task_args: Tuple[Any, ...], exit_code:
 
 PROCESS_TASKS = {
     "chat_request": run_chat_request,
+    "chat_continuation": run_chat_continuation_request,
     "qid_mood": run_qid_mood_request,
     "road_scan": run_road_scan,
 }
 
 
-def process_task_runner(result_queue: Any, task_name: str, task_args: Tuple[Any, ...]) -> None:
+def process_task_runner(result_queue: Any, stop_event: Any, control_queue: Any, task_name: str, task_args: Tuple[Any, ...]) -> None:
+    def reporter(kind: str, payload: Any) -> None:
+        result_queue.put(("report", kind, payload))
+
     try:
         task_fn = PROCESS_TASKS[task_name]
-        result = task_fn(*task_args)
+        result = task_fn(*task_args, reporter=reporter, stop_event=stop_event, control_queue=control_queue)
     except Exception as exc:
         result_queue.put(("error", f"{exc}\n\n{traceback.format_exc()}"))
     else:
@@ -3723,6 +4553,13 @@ class HumoidStudioApp(AppBase):
         self.last_scan_result: Optional[Dict[str, str]] = None
         self.history_offset = 0
         self.active_process: Optional[mp.Process] = None
+        self.active_process_stop_event: Optional[Any] = None
+        self.active_process_control_queue: Optional[Any] = None
+        self.active_process_task_name = ""
+        self.continuation_wrap_requested = False
+        self.active_continuation_planned_loops = 0
+        self.pending_continuation_steering = ""
+        self.pending_continuation_resume_packet = ""
         self.selected_image_path: Optional[Path] = None
         self.image_mode_var = tk.BooleanVar(value=False)
         self.image_status_var = tk.StringVar(value="Image mode off")
@@ -3803,12 +4640,24 @@ class HumoidStudioApp(AppBase):
         self.settings_strict_format_var = tk.BooleanVar(
             value=bool(self.settings_data.get("strict_prompt_formatting", True))
         )
+        self.continuation_mode_var = tk.BooleanVar(value=bool(self.settings_data.get("continuation_mode_enabled", False)))
+        self.continuation_loop_count_var = tk.StringVar(
+            value=str(normalize_continuation_loop_count(self.settings_data.get("continuation_loop_count", 3)))
+        )
+        self.continuation_auto_budget_var = tk.BooleanVar(
+            value=bool(self.settings_data.get("continuation_auto_budget", True))
+        )
+        self.continuation_steering_var = tk.StringVar()
+        self.continuation_status_var = tk.StringVar()
         self.update_chat_font_label()
         self.update_inference_backend_status()
         self.update_dynamic_rag_status()
         self.settings_dynamic_rag_var.trace_add("write", self.update_dynamic_rag_status)
         self.settings_dynamic_rag_mode_var.trace_add("write", self.update_dynamic_rag_status)
         self.settings_inference_backend_var.trace_add("write", self.update_inference_backend_status)
+        self.continuation_mode_var.trace_add("write", self.on_continuation_preference_changed)
+        self.continuation_loop_count_var.trace_add("write", self.on_continuation_preference_changed)
+        self.continuation_auto_budget_var.trace_add("write", self.on_continuation_preference_changed)
         self.change_current_password_var = tk.StringVar()
         self.change_new_password_var = tk.StringVar()
         self.change_confirm_password_var = tk.StringVar()
@@ -4036,6 +4885,118 @@ class HumoidStudioApp(AppBase):
             self.progress_bar.stop()
             self.progress_bar.configure(mode="determinate")
             self.progress_bar.set(0)
+        self.update_continuation_ui_state()
+
+    def current_continuation_loop_count(self) -> int:
+        return normalize_continuation_loop_count(self.continuation_loop_count_var.get())
+
+    def persist_continuation_preferences(self) -> None:
+        self.settings_data["continuation_mode_enabled"] = bool(self.continuation_mode_var.get())
+        self.settings_data["continuation_loop_count"] = self.current_continuation_loop_count()
+        self.settings_data["continuation_auto_budget"] = bool(self.continuation_auto_budget_var.get())
+        try:
+            save_settings(self.settings_data)
+        except Exception:
+            pass
+
+    def on_continuation_preference_changed(self, *_args: Any) -> None:
+        if hasattr(self, "continuation_loop_count_var"):
+            normalized = str(self.current_continuation_loop_count())
+            if self.continuation_loop_count_var.get() != normalized:
+                self.continuation_loop_count_var.set(normalized)
+                return
+        self.persist_continuation_preferences()
+        self.update_continuation_ui_state()
+
+    def update_continuation_ui_state(self) -> None:
+        enabled_mode = bool(self.continuation_mode_var.get()) if hasattr(self, "continuation_mode_var") else False
+        active_continuation = self.busy and self.active_process_task_name == "chat_continuation"
+        requested_loops = self.active_continuation_planned_loops or self.current_continuation_loop_count()
+        auto_budget = bool(self.continuation_auto_budget_var.get()) if hasattr(self, "continuation_auto_budget_var") else True
+        pending_bits: List[str] = []
+        if self.pending_continuation_steering:
+            pending_bits.append(f"steering queued: {compact_text_excerpt(self.pending_continuation_steering, max_chars=90)}")
+        if self.pending_continuation_resume_packet:
+            pending_bits.append("resume packet primed")
+
+        if active_continuation and self.continuation_wrap_requested:
+            status_text = "Wrap-up requested. Finishing the current loop, then packaging a human handoff."
+        elif active_continuation:
+            status_text = (
+                f"Continuation mode is running {requested_loops} stitched loop(s). "
+                "Press the button to wrap after the current loop."
+            )
+        elif enabled_mode:
+            status_text = (
+                f"Continuation mode is on. Send will run {self.current_continuation_loop_count()} stitched loop(s) "
+                f"before replying. Auto budget is {'on' if auto_budget else 'off'}."
+            )
+        else:
+            status_text = (
+                "Single-pass replies are on. Enable continuation to stretch long coding or planning work "
+                "across stitched loop windows."
+            )
+        if pending_bits:
+            status_text += " Pending: " + " | ".join(pending_bits) + "."
+        self.continuation_status_var.set(status_text)
+
+        if hasattr(self, "show_so_far_button"):
+            button_text = "Wrapping Up..." if active_continuation and self.continuation_wrap_requested else "Show Me What You Have So Far"
+            button_state = "disabled"
+            if active_continuation and not self.continuation_wrap_requested:
+                button_state = "normal"
+            try:
+                self.show_so_far_button.configure(text=button_text, state=button_state)
+            except Exception:
+                pass
+
+    def request_continuation_wrap_up(self) -> None:
+        if not self.busy or self.active_process_task_name != "chat_continuation":
+            self.status_var.set("No continuation run is active right now.")
+            self.update_continuation_ui_state()
+            return
+        if self.continuation_wrap_requested:
+            self.status_var.set("Wrap-up already requested. Waiting for the current loop to finish.")
+            return
+        if self.active_process_stop_event is None:
+            self.status_var.set("This continuation run cannot be wrapped up right now.")
+            return
+        self.active_process_stop_event.set()
+        self.continuation_wrap_requested = True
+        self.status_var.set("Wrap-up requested. The current loop will finish, then the continuation agent will stop cleanly.")
+        self.update_continuation_ui_state()
+
+    def apply_continuation_steering(self, preset_label: Optional[str] = None) -> None:
+        preset_note = CONTINUATION_STEERING_PRESETS.get(preset_label or "", "")
+        typed_note = sanitize_text(self.continuation_steering_var.get(), max_chars=700).strip()
+        note = preset_note or typed_note
+        if not note:
+            self.status_var.set("Enter a steering note or use one of the steering presets.")
+            return
+        if self.busy and self.active_process_task_name == "chat_continuation" and self.active_process_control_queue is not None:
+            try:
+                self.active_process_control_queue.put({"kind": "steer", "text": note})
+                self.status_var.set("Steering sent to the continuation agent for the next loop.")
+            except Exception as exc:
+                self.status_var.set(f"Could not send steering live: {sanitize_text(exc, max_chars=120)}")
+                return
+        else:
+            self.pending_continuation_steering = note
+            self.status_var.set("Steering queued for the next continuation run.")
+        self.continuation_steering_var.set("")
+        self.update_continuation_ui_state()
+
+    def prime_resume_from_last_handoff(self) -> None:
+        if not self.ensure_unlocked():
+            return
+        resume_packet = load_continuation_resume_packet(self.key)
+        if not resume_packet:
+            self.status_var.set("No saved continuation handoff is available yet.")
+            return
+        self.pending_continuation_resume_packet = resume_packet
+        self.continuation_mode_var.set(True)
+        self.status_var.set("Last continuation handoff primed. The next continuation run will resume from that packet.")
+        self.update_continuation_ui_state()
 
     def open_startup_dialog(self) -> None:
         dialog = StartupPasswordDialog(self)
@@ -4071,6 +5032,8 @@ class HumoidStudioApp(AppBase):
                 else ""
             )
             self.status_var.set(f"Unlocked, but the history vault could not be initialized: {exc}.{recovery_note}")
+        self.update_continuation_ui_state()
+        self.refresh_memory_preview()
         self.refresh_dashboard()
         self.after(700, self.request_qid_mood_generation)
         self.after(900, self.offer_first_model_download)
@@ -4484,27 +5447,52 @@ class HumoidStudioApp(AppBase):
                 messagebox.showinfo("One task at a time", "A background job is already running.")
             return
 
-        self.set_busy(True, label)
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
-        process = ctx.Process(target=process_task_runner, args=(result_queue, task_name, task_args), daemon=True)
-        process.start()
+        stop_event = ctx.Event()
+        control_queue = ctx.Queue()
+        self.active_process_stop_event = stop_event
+        self.active_process_control_queue = control_queue
+        self.active_process_task_name = task_name
+        self.set_busy(True, label)
+        process = ctx.Process(
+            target=process_task_runner,
+            args=(result_queue, stop_event, control_queue, task_name, task_args),
+            daemon=True,
+        )
+        try:
+            process.start()
+        except Exception:
+            self.active_process_stop_event = None
+            self.active_process_control_queue = None
+            self.active_process_task_name = ""
+            self.set_busy(False)
+            raise
         self.active_process = process
 
         def watcher() -> None:
+            final_kind = ""
+            final_payload: Any = None
             try:
                 while True:
                     try:
-                        kind, payload = result_queue.get(timeout=0.2)
-                        break
+                        event = result_queue.get(timeout=0.2)
                     except queue.Empty:
                         if not process.is_alive():
                             exit_code = process.exitcode
                             try:
-                                kind, payload = result_queue.get(timeout=0.5)
-                                break
+                                event = result_queue.get(timeout=0.5)
                             except queue.Empty:
                                 pass
+                            else:
+                                kind = event[0]
+                                if kind == "report":
+                                    _, report_kind, report_payload = event
+                                    self.task_queue.put(("report", report_kind, report_payload))
+                                    continue
+                                final_kind = kind
+                                final_payload = event[1] if len(event) > 1 else None
+                                break
                             cleanup_worker_artifacts(remove_worker_caches=True)
                             self.task_queue.put(
                                 (
@@ -4514,18 +5502,31 @@ class HumoidStudioApp(AppBase):
                                 )
                             )
                             return
+                        continue
+                    kind = event[0]
+                    if kind == "report":
+                        _, report_kind, report_payload = event
+                        self.task_queue.put(("report", report_kind, report_payload))
+                        continue
+                    final_kind = kind
+                    final_payload = event[1] if len(event) > 1 else None
+                    break
             finally:
                 process.join(timeout=5.0)
                 result_queue.close()
+                control_queue.close()
                 if process.exitcode is not None:
                     cleanup_worker_artifacts(remove_worker_caches=True)
                 self.active_process = None
+                self.active_process_stop_event = None
+                self.active_process_control_queue = None
+                self.active_process_task_name = ""
 
-            if kind == "success":
+            if final_kind == "success":
                 queue_kind = "success" if refresh_on_success else "success_no_refresh"
-                self.task_queue.put((queue_kind, payload, on_success))
+                self.task_queue.put((queue_kind, final_payload, on_success))
             else:
-                self.task_queue.put(("error", RuntimeError(str(payload)), on_error))
+                self.task_queue.put(("error", RuntimeError(str(final_payload)), on_error))
 
         threading.Thread(target=watcher, daemon=True).start()
 
@@ -5164,6 +6165,150 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             font=self.small_font,
             text_color=PALETTE["muted"],
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        continuation_bar = ctk.CTkFrame(compose, fg_color="transparent")
+        continuation_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        continuation_bar.grid_columnconfigure(0, weight=1)
+
+        continuation_left = ctk.CTkFrame(continuation_bar, fg_color="transparent")
+        continuation_left.grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(
+            continuation_left,
+            text="Continuation",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(side="left", padx=(0, 8))
+
+        continuation_switch = ctk.CTkSwitch(
+            continuation_left,
+            text="Mode",
+            variable=self.continuation_mode_var,
+            progress_color=PALETTE["accent_blue"],
+            button_color=PALETTE["accent_blue"],
+            button_hover_color="#12af63",
+            text_color=PALETTE["text"],
+            font=self.small_font,
+        )
+        continuation_switch.pack(side="left", padx=(0, 10))
+        self.register_action(continuation_switch)
+
+        continuation_menu = ctk.CTkOptionMenu(
+            continuation_left,
+            values=CONTINUATION_LOOP_OPTIONS,
+            variable=self.continuation_loop_count_var,
+            fg_color=PALETTE["panel_alt"],
+            button_color=PALETTE["accent_blue"],
+            button_hover_color="#12af63",
+            dropdown_fg_color=PALETTE["panel_alt"],
+            dropdown_hover_color=PALETTE["card_soft"],
+            text_color=PALETTE["text"],
+            font=self.small_font,
+            width=92,
+            height=34,
+            corner_radius=14,
+        )
+        continuation_menu.pack(side="left")
+        self.register_action(continuation_menu)
+
+        continuation_auto_switch = ctk.CTkSwitch(
+            continuation_left,
+            text="Auto Budget",
+            variable=self.continuation_auto_budget_var,
+            progress_color=PALETTE["accent_gold"],
+            button_color=PALETTE["accent_gold"],
+            button_hover_color="#75e69a",
+            text_color=PALETTE["text"],
+            font=self.small_font,
+        )
+        continuation_auto_switch.pack(side="left", padx=(10, 0))
+        self.register_action(continuation_auto_switch)
+
+        self.show_so_far_button = self.make_button(
+            continuation_bar,
+            "Show Me What You Have So Far",
+            self.request_continuation_wrap_up,
+            4,
+            width=240,
+            height=34,
+        )
+        self.show_so_far_button.grid(row=0, column=1, sticky="e")
+        self.register_action(self.show_so_far_button, allow_during_busy=True)
+
+        ctk.CTkLabel(
+            compose,
+            textvariable=self.continuation_status_var,
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+            justify="left",
+            wraplength=920,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        steering_bar = ctk.CTkFrame(compose, fg_color="transparent")
+        steering_bar.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        steering_bar.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            steering_bar,
+            text="Steering",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        steering_entry = ctk.CTkEntry(
+            steering_bar,
+            textvariable=self.continuation_steering_var,
+            fg_color=PALETTE["panel_alt"],
+            text_color=PALETTE["text"],
+            border_color=PALETTE["line"],
+            corner_radius=14,
+            placeholder_text="Queue a custom steering note for the next loop or next run",
+        )
+        steering_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        self.register_action(steering_entry, allow_during_busy=True)
+
+        steering_apply_button = self.make_button(
+            steering_bar,
+            "Apply Steering",
+            self.apply_continuation_steering,
+            3,
+            width=138,
+            height=34,
+        )
+        steering_apply_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
+        self.register_action(steering_apply_button, allow_during_busy=True)
+
+        resume_last_button = self.make_button(
+            steering_bar,
+            "Resume Last Handoff",
+            self.prime_resume_from_last_handoff,
+            2,
+            width=170,
+            height=34,
+        )
+        resume_last_button.grid(row=0, column=3, sticky="e")
+        self.register_action(resume_last_button)
+
+        steering_presets = ctk.CTkFrame(compose, fg_color="transparent")
+        steering_presets.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ctk.CTkLabel(
+            steering_presets,
+            text="Quick Presets",
+            font=self.small_font,
+            text_color=PALETTE["muted"],
+        ).pack(side="left", padx=(0, 8))
+        for label in CONTINUATION_STEERING_PRESET_LABELS:
+            preset_button = self.make_button(
+                steering_presets,
+                label,
+                lambda preset=label: self.apply_continuation_steering(preset),
+                5,
+                width=96,
+                height=30,
+            )
+            preset_button.pack(side="left", padx=(0, 6))
+            self.register_action(preset_button, allow_during_busy=True)
+        self.update_continuation_ui_state()
 
         self.chat_toolbar_visible = False
         compact_toolbar = ctk.CTkFrame(left, fg_color="transparent")
@@ -6553,6 +7698,22 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 self.memory_preview.insert("end", f"{label}: ", ("meta",))
                 self.insert_markdown_text(self.memory_preview, message, max_chars=5000)
                 self.memory_preview.insert("end", "\n")
+        if self.key is not None:
+            try:
+                workspace_state = load_continuation_workspace_state(self.key)
+            except Exception:
+                workspace_state = {}
+            if workspace_state:
+                self.memory_preview.insert("end", "\nContinuation capsule:\n", ("assistant_header",))
+                capsule_lines = [
+                    f"Milestone: {workspace_state.get('milestone', 'n/a')}",
+                    f"Role: {workspace_state.get('role', 'n/a')}",
+                    f"Progress: {workspace_state.get('progress', 'n/a')}",
+                    f"Next focus: {workspace_state.get('next_focus', 'n/a')}",
+                    f"Handoff: {workspace_state.get('handoff', 'n/a')}",
+                ]
+                self.insert_markdown_text(self.memory_preview, "\n".join(capsule_lines), max_chars=5000)
+                self.memory_preview.insert("end", "\n")
         self.memory_preview.configure(state="disabled")
 
     def refresh_dashboard(self) -> None:
@@ -6811,6 +7972,14 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             DYNAMIC_SUPPORT_RAG_MODE_OPTIONS,
             "Builder",
         )
+        continuation_mode = bool(self.continuation_mode_var.get())
+        continuation_loop_count = self.current_continuation_loop_count()
+        continuation_auto_budget = bool(self.continuation_auto_budget_var.get())
+        continuation_steering = self.pending_continuation_steering or sanitize_text(
+            self.continuation_steering_var.get(),
+            max_chars=700,
+        ).strip()
+        continuation_resume_packet = self.pending_continuation_resume_packet
         display_prompt = prompt
         if image_path:
             mode = "native" if native_image_input else "metadata"
@@ -6818,35 +7987,72 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.append_chat_message("You", display_prompt)
         self.chat_input.delete("1.0", "end")
         self.update_chat_input_stats()
-        self.status_var.set("Sending prompt to the local model...")
+        if continuation_mode:
+            self.status_var.set(f"Starting continuation mode with {continuation_loop_count} loops...")
+        else:
+            self.status_var.set("Sending prompt to the local model...")
 
-        def on_success(reply: str) -> None:
+        def on_success(result: Any) -> None:
+            continuation_result = result if isinstance(result, dict) else {}
+            reply = continuation_result.get("reply", result)
             safe_reply = sanitize_text(reply)
             memory_prompt = display_prompt if image_path else prompt
             needs_first_prompt_title = self.current_session_id is not None and not self.session_title_requested
+            self.continuation_wrap_requested = False
+            self.active_continuation_planned_loops = 0
+            self.pending_continuation_steering = ""
+            self.pending_continuation_resume_packet = ""
             self.chat_memory.extend([("user", memory_prompt), ("assistant", safe_reply)])
             self.tts_last_text = safe_reply
             self.append_chat_message("Gemma", safe_reply)
             self.refresh_memory_preview()
-            self.status_var.set("Reply ready. The model vault has been sealed again.")
+            if continuation_mode:
+                completed_loops = int(continuation_result.get("completed_loops", continuation_loop_count))
+                requested_loops = int(continuation_result.get("requested_loops", continuation_loop_count))
+                wrapped_up = bool(continuation_result.get("wrapped_up", False))
+                if wrapped_up and completed_loops < requested_loops:
+                    self.status_var.set(
+                        f"Continuation wrap-up ready after {completed_loops}/{requested_loops} loops. "
+                        "The handoff is ready for a later human-guided resume."
+                    )
+                else:
+                    self.status_var.set(
+                        f"Continuation mode finished {completed_loops}/{requested_loops} loops and sealed the reply."
+                    )
+            else:
+                self.status_var.set("Reply ready. The model vault has been sealed again.")
             if self.tts_enabled_var.get():
                 self.speak_text(safe_reply)
             self.save_first_prompt_session_title(prompt, safe_reply)
             if not needs_first_prompt_title:
                 self.refresh_dashboard()
+            self.update_continuation_ui_state()
 
         def on_error(exc: Exception) -> None:
+            self.continuation_wrap_requested = False
+            self.active_continuation_planned_loops = 0
             self.status_var.set(str(exc))
             if image_path:
                 self.clear_prompt_image()
                 self.image_status_var.set("Image mode off after worker crash")
+            self.update_continuation_ui_state()
             if messagebox:
                 messagebox.showerror("Generation failed", str(exc))
 
-        self.run_process_task(
-            "Generating a local reply...",
-            "chat_request",
-            (
+        task_name = "chat_continuation" if continuation_mode else "chat_request"
+        task_label = (
+            f"Running continuation agent ({continuation_loop_count} loops)..."
+            if continuation_mode
+            else "Generating a local reply..."
+        )
+        task_args: Tuple[Any, ...]
+        if continuation_mode:
+            self.continuation_wrap_requested = False
+            self.active_continuation_planned_loops = continuation_loop_count
+            self.pending_continuation_steering = ""
+            self.pending_continuation_resume_packet = ""
+            self.continuation_steering_var.set("")
+            task_args = (
                 self.key,
                 prompt,
                 memory_snapshot,
@@ -6860,7 +8066,32 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
                 inference_backend,
                 enable_dynamic_support_rag,
                 dynamic_support_rag_mode,
-            ),
+                continuation_loop_count,
+                continuation_auto_budget,
+                continuation_steering,
+                continuation_resume_packet,
+            )
+        else:
+            task_args = (
+                self.key,
+                prompt,
+                memory_snapshot,
+                memory_turns,
+                image_path,
+                native_image_input,
+                session_id,
+                chat_style,
+                response_depth,
+                strict_prompt_formatting,
+                inference_backend,
+                enable_dynamic_support_rag,
+                dynamic_support_rag_mode,
+            )
+
+        self.run_process_task(
+            task_label,
+            task_name,
+            task_args,
             on_success=on_success,
             on_error=on_error,
             refresh_on_success=False,
@@ -7191,15 +8422,21 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
             self.settings_response_depth_var.get(), CHAT_DEPTH_OPTIONS, "Normal"
         )
         self.settings_data["strict_prompt_formatting"] = bool(self.settings_strict_format_var.get())
+        self.settings_data["continuation_mode_enabled"] = bool(self.continuation_mode_var.get())
+        self.settings_data["continuation_loop_count"] = self.current_continuation_loop_count()
+        self.settings_data["continuation_auto_budget"] = bool(self.continuation_auto_budget_var.get())
         save_settings(self.settings_data)
         self.update_inference_backend_status()
         self.update_dynamic_rag_status()
+        self.update_continuation_ui_state()
         self.status_var.set(
             "Settings saved. Prompt profile: "
             f"{self.settings_data['chat_style']} / {self.settings_data['response_depth']} "
             f"with {self.settings_data['chat_font_size']} px chat text. "
             f"Inference: {self.settings_data['inference_backend']}. "
-            f"Support RAG: {'on' if self.settings_data['enable_dynamic_support_rag'] else 'off'}."
+            f"Support RAG: {'on' if self.settings_data['enable_dynamic_support_rag'] else 'off'}. "
+            f"Continuation: {'on' if self.settings_data['continuation_mode_enabled'] else 'off'} "
+            f"({self.settings_data['continuation_loop_count']} loops, auto budget {'on' if self.settings_data['continuation_auto_budget'] else 'off'})."
         )
 
     def advance_rotation_machine_action(self) -> None:
@@ -7265,6 +8502,14 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         cleanup_worker_artifacts(remove_worker_caches=True)
         self.key = None
         self.key_mode = "locked"
+        self.active_process_stop_event = None
+        self.active_process_control_queue = None
+        self.active_process_task_name = ""
+        self.continuation_wrap_requested = False
+        self.active_continuation_planned_loops = 0
+        self.pending_continuation_steering = ""
+        self.pending_continuation_resume_packet = ""
+        self.continuation_steering_var.set("")
         self.current_session_id = None
         self.current_session_started_at = ""
         self.current_session_title = ""
@@ -7282,6 +8527,7 @@ If a runtime rejects that backend or crashes, the GUI keeps the encrypted vault 
         self.reset_qid_display()
         self.update_model_status_box(storage_summary(None))
         self.set_action_state(False)
+        self.update_continuation_ui_state()
         self.open_startup_dialog()
 
     def on_close(self) -> None:

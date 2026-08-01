@@ -37,3 +37,4 @@ road_scan_*.json
 models/runtime-gemma-4-E2B-it.litertlm.vision_adapter.xnnpack_cache
 .gitignore
 models/runtime-gemma-4-E2B-it.litertlm.vision_encoder.xnnpack_cache
+models/gemma-4-E2B-it.litertlm.partial

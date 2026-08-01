@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Humoid Gemma 4 GUI
+Comment=Launch Humoid Gemma 4 GUI
+GenericName=AI GUI
+Exec=/home/a41371777/code/humoid-gui-gemma-4/humoid-gemma-4-gui.sh %F
+Icon=applications-development
+Type=Application
+Terminal=false
+StartupNotify=false
+StartupWMClass=Humoid Gemma 4 GUI
+Categories=Development;Utility;
+Keywords=humoid;gemma;ai;gui;

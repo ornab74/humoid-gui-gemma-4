@@ -5,7 +5,11 @@ on:
   push:
     paths:
       - requirements.in
-      - .github/workflows/lock-and-pq-sign-lockfile.yml
+      - .github/workflows/lock-requirements.yml
+  pull_request:
+    paths:
+      - requirements.in
+      - .github/workflows/lock-requirements.yml
 
 jobs:
   lock_and_pq_sign:
@@ -53,7 +57,9 @@ jobs:
           LIBOQS_URL="https://github.com/open-quantum-safe/liboqs/archive/refs/tags/${LIBOQS_VERSION}.tar.gz"
 
           curl -fsSL -o /tmp/liboqs.tar.gz "${LIBOQS_URL}"
-          LIBOQS_SHA256="$(sha256sum /tmp/liboqs.tar.gz | awk '{print $1}')"
+          # Trusted SHA-256 for the liboqs 0.14.0 release archive.
+          LIBOQS_SHA256="5b0df6138763b3fc4e385d58dbb2ee7c7c508a64a413d76a917529e3a9a207ea"
+          echo "${LIBOQS_SHA256}  /tmp/liboqs.tar.gz" | sha256sum --check --status
 
           echo "LIBOQS_VERSION=${LIBOQS_VERSION}" >> "$GITHUB_ENV"
           echo "LIBOQS_URL=${LIBOQS_URL}" >> "$GITHUB_ENV"
@@ -78,8 +84,16 @@ jobs:
       - name: Install liboqs-python (oqs module)
         run: |
           set -euo pipefail
-          pip install "liboqs-python==0.14.1"
-          python -c "import oqs; print('oqs ready')"
+          # Version 0.14.0 is released on GitHub, but is not available on PyPI.
+          # Match the Python wrapper to the already installed liboqs 0.14.0.
+          python -m pip install "git+https://github.com/open-quantum-safe/liboqs-python.git@0.14.0"
+          python - <<'PY'
+          import oqs
+          version = oqs.oqs_version()
+          assert version == "0.14.0", f"Expected liboqs 0.14.0, got {version}"
+          assert "Dilithium2" in oqs.get_enabled_sig_mechanisms(), "Dilithium2 unavailable"
+          print(f"liboqs {version}, Python bindings ready; Dilithium2 available")
+          PY
 
       - name: Prepend provenance header into requirements.txt (BEFORE hashing/signing)
         run: |

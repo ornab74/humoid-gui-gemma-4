@@ -6,6 +6,10 @@ on:
     paths:
       - requirements.in
       - .github/workflows/lock-requirements.yml
+  pull_request:
+    paths:
+      - requirements.in
+      - .github/workflows/lock-requirements.yml
 
 jobs:
   lock_and_pq_sign:

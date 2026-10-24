@@ -5,7 +5,13 @@ on:
   push:
     paths:
       - requirements.in
-      - .github/workflows/lock-and-pq-sign-lockfile.yml
+      - .github/workflows/lock-requirements.yml
+
+env:
+  LIBOQS_VERSION: "0.14.0"
+  LIBOQS_SHA256: "5b0df6138763b3fc4e385d58dbb2ee7c7c508a64a413d76a917529e3a9a207ea"
+  LIBOQS_PYTHON_VERSION: "0.16.0"
+  PQ_SIGNATURE_ALG: "ML-DSA-44"
 
 jobs:
   lock_and_pq_sign:
@@ -49,15 +55,13 @@ jobs:
       - name: Build + install liboqs
         run: |
           set -euo pipefail
-          LIBOQS_VERSION="0.14.0"
           LIBOQS_URL="https://github.com/open-quantum-safe/liboqs/archive/refs/tags/${LIBOQS_VERSION}.tar.gz"
 
-          curl -fsSL -o /tmp/liboqs.tar.gz "${LIBOQS_URL}"
-          LIBOQS_SHA256="$(sha256sum /tmp/liboqs.tar.gz | awk '{print $1}')"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 \
+            -o /tmp/liboqs.tar.gz "${LIBOQS_URL}"
+          echo "${LIBOQS_SHA256}  /tmp/liboqs.tar.gz" | sha256sum -c -
 
-          echo "LIBOQS_VERSION=${LIBOQS_VERSION}" >> "$GITHUB_ENV"
           echo "LIBOQS_URL=${LIBOQS_URL}" >> "$GITHUB_ENV"
-          echo "LIBOQS_SHA256=${LIBOQS_SHA256}" >> "$GITHUB_ENV"
 
           mkdir -p /tmp/liboqs-src
           tar -xzf /tmp/liboqs.tar.gz -C /tmp/liboqs-src --strip-components=1
@@ -75,11 +79,21 @@ jobs:
 
           rm -rf /tmp/liboqs-src /tmp/liboqs.tar.gz
 
-      - name: Install liboqs-python (oqs module)
+      - name: Install verified liboqs-python (oqs module)
         run: |
           set -euo pipefail
-          pip install "liboqs-python==0.14.1"
-          python -c "import oqs; print('oqs ready')"
+          cat > /tmp/liboqs-python.requirements.txt <<'EOF'
+          liboqs-python==0.16.0 \
+              --hash=sha256:50bb11a9767b88f68099cedef8de09f798f31eaba1aa18b483988bfcd50df440 \
+              --hash=sha256:ee01445ccfbeab8dced956a642ce1eb5ba69438caba7ec291eea14083627d5c0
+          EOF
+          python -m pip install --no-cache-dir --require-hashes -r /tmp/liboqs-python.requirements.txt
+          python - <<'PY'
+          import oqs
+          enabled = set(oqs.get_enabled_sig_mechanisms())
+          assert "ML-DSA-44" in enabled, f"ML-DSA-44 unavailable; enabled={sorted(enabled)}"
+          print("oqs ready: ML-DSA-44 enabled")
+          PY
 
       - name: Prepend provenance header into requirements.txt (BEFORE hashing/signing)
         run: |
@@ -88,7 +102,8 @@ jobs:
             echo "# liboqs_version=${LIBOQS_VERSION}"
             echo "# liboqs_tarball_sha256=${LIBOQS_SHA256}"
             echo "# liboqs_tarball_url=${LIBOQS_URL}"
-            echo "# pq_signature_alg=Dilithium2"
+            echo "# liboqs_python_version=${LIBOQS_PYTHON_VERSION}"
+            echo "# pq_signature_alg=${PQ_SIGNATURE_ALG}"
             echo "# pq_manifest=lock.manifest.json"
             echo "# pq_signature=lock.manifest.pqsig"
             echo "# pq_pubkey=pq_pubkey.b64"
@@ -98,7 +113,7 @@ jobs:
           } > requirements.tmp
           mv requirements.tmp requirements.txt
 
-      - name: Create canonical lock manifest + PQ-sign it (Dilithium2)
+      - name: Create canonical lock manifest + ML-DSA sign it
         run: |
           set -euo pipefail
 
@@ -107,7 +122,7 @@ jobs:
           import base64, hashlib, json, os, re, sys
           import oqs
 
-          ALG = "Dilithium2"
+          ALG = os.environ["PQ_SIGNATURE_ALG"]
           REQ_PATH = "requirements.txt"
 
           if not os.path.exists(REQ_PATH):

@@ -44,6 +44,10 @@ flowchart TD
 
 ## What It Does
 
+### Loop Mode capacity
+
+Loop Mode can run a long sequence of locally generated debate turns and checkpoint each completed turn in the encrypted vault. It does not impose a RAM-based loop cap or automatically shorten generation based on installed memory. As a practical estimate, an 8 GB RAM machine can typically reach around 310 loops, but the actual maximum varies with the operating system, inference backend, model/runtime version, prompt size, and other applications using memory. Systems with more RAM may run substantially more loops.
+
 - Runs a local Gemma LiteRT-LM model through `litert-lm`.
 - Stores the model encrypted at rest as `models/*.litertlm.aes`.
 - Uses a temporary runtime model copy only when the model needs to run.
@@ -276,7 +280,7 @@ Current direct Python dependencies:
 litert-lm==0.10.1
 httpx==0.28.0
 aiosqlite==0.21.0
-cryptography==46.0.1
+cryptography==50.0.2
 psutil==6.1.1
 pennylane==0.41.0
 customtkinter==5.2.2
